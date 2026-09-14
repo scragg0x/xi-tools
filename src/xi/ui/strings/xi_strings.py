@@ -85,7 +85,7 @@ CATEGORY_NAMES = sorted(_CATEGORIES.keys())
 def _rom_to_disk(rom_path: str) -> Path:
     """Resolve a ROM-relative path (e.g. 'ROM/181/73.DAT') to a full disk path,
     preferring the output-dir mirror when it exists."""
-    full = Path(FFXI_DIR) / Path(rom_path.replace('/', '\\'))
+    full = Path(FFXI_DIR) / Path(rom_path)
     out = output_path_for(full)
     return out if out.exists() else full
 

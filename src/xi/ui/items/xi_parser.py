@@ -444,8 +444,8 @@ def parse_dat(ffxi_dir: str, cat_name: str, base_id: int, item_type: int,
     (0xC00) and a retail (0x1400) file decode the same way — even mixed."""
     from xi.xi_config import FFXI_DIR
 
-    en_path = Path(FFXI_DIR) / Path(en_rom.replace('/', '\\'))
-    jp_path = Path(FFXI_DIR) / Path(jp_rom.replace('/', '\\'))
+    en_path = Path(FFXI_DIR) / Path(en_rom)
+    jp_path = Path(FFXI_DIR) / Path(jp_rom)
 
     if not en_path.exists():
         return

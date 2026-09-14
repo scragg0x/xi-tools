@@ -45,7 +45,7 @@ MGC_RECORD_COUNT = 0x400   # 1024
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _resolve(rom_path: str) -> Path:
-    full = Path(FFXI_DIR) / Path(rom_path.replace('/', '\\'))
+    full = Path(FFXI_DIR) / Path(rom_path)
     out = output_path_for(full)
     return out if out.exists() else full
 

@@ -166,7 +166,7 @@ def _load_item_tables() -> None:
         from xi.xi_config import FFXI_DIR
         present = []
         for cat_name, base_id, item_type, en_rom, jp_rom in ITEM_DATS:
-            fp = Path(FFXI_DIR) / Path(en_rom.replace("/", "\\"))
+            fp = Path(FFXI_DIR) / Path(en_rom)
             if fp.exists():
                 st = fp.stat()
                 present.append((cat_name, base_id, item_type, en_rom, jp_rom, st.st_size, int(st.st_mtime)))
