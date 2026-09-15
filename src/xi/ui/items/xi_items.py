@@ -61,7 +61,7 @@ _SPLIT_GROUPS = {
 
 
 def _dat_path(en_rom: str) -> Path:
-    return Path(FFXI_DIR) / Path(en_rom.replace('/', '\\'))
+    return Path(FFXI_DIR) / Path(en_rom)
 
 
 def _item_to_dict(item):
