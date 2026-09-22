@@ -31,6 +31,7 @@ onto the bow hand and brings it into the export.
 
 import json
 from dataclasses import dataclass, field
+from os.path import commonprefix
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -211,12 +212,20 @@ def merge_pose_clip(anim: str, clip_sources, num_joints: int):
 
     A name that already ends in a digit (``idl1``) is taken literally — that asks for one
     specific layer. Later sources win a joint they share with an earlier one, so pass the
-    base skeleton first and motion packs after."""
+    base skeleton first and motion packs after.
+
+    Comma-separated names (``na10,na11``) merge exactly those clips, in that order. That
+    is the way to reach a clip whose own name ends in a digit — ``na1``'s rig variants —
+    which the rule above would read as a single layer. The merge is named after the
+    names' common prefix."""
+    wanted = [n.strip() for n in anim.split(",") if n.strip()] if "," in anim else None
     explicit = anim[-1:].isdigit()
     base = anim if explicit else anim.rstrip("0123456789")
+    if wanted:
+        base = commonprefix(wanted) or wanted[0]
     layers = []
     for data, sections in clip_sources:
-        names = ([anim] if explicit else animation_variants(data, base))
+        names = wanted or ([anim] if explicit else animation_variants(data, base))
         for nm in names:
             try:
                 layers.append((data, choose_animation(sections, nm)))
@@ -603,7 +612,8 @@ def _resolve_dat(spec: str) -> Path:
               help="Output directory (default: exports/gear/pose/<name>/).")
 @click.option("--name", default=None, help="Base name for the .glb (default: the race, look or first DAT).")
 @click.option("--anim", default="idl", show_default=True,
-              help="Animation tag to pose to; pass --anim '' for the neutral bind pose.")
+              help="Animation tag to pose to; pass --anim '' for the neutral bind pose. "
+                   "Comma-separated names (na10,na11) merge exactly those clips.")
 @click.option("--frame", type=int, default=0, show_default=True,
               help="Frame of --anim to pose at, on the 30 fps playback timeline (the same "
                    "frame number a viewer shows), clamped to the clip's length.")
