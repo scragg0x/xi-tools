@@ -153,9 +153,13 @@ def _lowest_weighted_joint(source: PoseSource) -> Optional[int]:
     return lowest
 
 
-def _weapon_overrides(sources: List[PoseSource], references, draw_ranged: bool) -> Tuple[dict, list]:
+def _weapon_overrides(sources: List[PoseSource], references, draw_ranged: bool,
+                      draw_melee: bool = True) -> Tuple[dict, list]:
     """``{grip_joint: hand_joint}`` re-parentings that put the drawn weapons in the hands,
-    plus a human-readable note per weapon for the summary."""
+    plus a human-readable note per weapon for the summary.
+
+    With ``draw_melee`` false the main and sub weapons stay on their own grip joints —
+    stowed, for a clip (the race idle) that carries those joints to the hip or back."""
     overrides: dict = {}
     notes: list = []
     if len(references) <= HAND_REF_RIGHT:
@@ -165,7 +169,8 @@ def _weapon_overrides(sources: List[PoseSource], references, draw_ranged: bool) 
                                  f"(need {HAND_REF_RIGHT + 1}) — weapons left at bind pose"})
         return overrides, notes
 
-    for slot, hand_ref in (("main", HAND_REF_RIGHT), ("sub", HAND_REF_LEFT)):
+    hands = (("main", HAND_REF_RIGHT), ("sub", HAND_REF_LEFT)) if draw_melee else ()
+    for slot, hand_ref in hands:
         for source in (s for s in sources if s.slot == slot):
             grip_ref = parse_info(source.data, source.sections)["standard_joint_index"]
             if grip_ref is None or grip_ref >= len(references):
@@ -346,7 +351,7 @@ def build_pose(sources: List[PoseSource], output_dir: Path, name: str = "pose",
                occlusion: bool = True, draw_ranged: bool = False,
                fbx: bool = False, alpha_scale: float = DEFAULT_ALPHA_SCALE,
                mesh_merge_dp: int = 4, weld: bool = True,
-               split_tex: bool = False) -> dict:
+               split_tex: bool = False, draw_melee: bool = True) -> dict:
     """Merge every DAT in ``sources`` onto one skeleton and write ``<name>.glb`` (+ PNGs,
     + ``.fbx`` when asked) into ``output_dir``.
 
@@ -430,7 +435,7 @@ def build_pose(sources: List[PoseSource], output_dir: Path, name: str = "pose",
         # node tree from parent_index and a renderer recomputes every joint from that
         # tree — an override applied only to the globals looks right in the baked vertex
         # positions and then slides the weapon back off the hand once the file is opened.
-        overrides, weapon_notes = _weapon_overrides(sources, references, draw_ranged)
+        overrides, weapon_notes = _weapon_overrides(sources, references, draw_ranged, draw_melee)
         joints = apply_parent_overrides(joints, overrides)
         globals_by_joint = compute_global_transforms(joints)
 

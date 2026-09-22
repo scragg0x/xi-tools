@@ -44,6 +44,7 @@ exception, by game design).
 
 import struct
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -387,6 +388,57 @@ def race_index(race) -> int:
         raise ValueError(f'race index {idx} out of range 0..{len(RACE_NAMES) - 1} '
                          f'(the client rejects actor race indices past Galka)')
     return idx
+
+
+# Files after a race's movement base that carry the rest of its movement clips:
+# two layer-1 packs (arms) and two layer-2 packs (waist).
+_MOVEMENT_COMPANIONS = 4
+
+
+@lru_cache(maxsize=1)
+def _cached_category_bases() -> Dict[str, Tuple[int, ...]]:
+    """:func:`category_bases` for the installed client, scanned once per process."""
+    return {cat: tuple(bases) for cat, bases in category_bases(load_maindll()).items()}
+
+
+@lru_cache(maxsize=1)
+def _cached_resolver() -> '_FileIdResolver':
+    return _FileIdResolver()
+
+
+@lru_cache(maxsize=16)
+def movement_motion_specs(race) -> Tuple[str, ...]:
+    """ROM specs of the companion packs that complete a race's movement clips.
+
+    The race body DAT holds layer 0 of idle/walk/run (the coarse 16-joint pass); layer
+    1 (arms, and the joints a stowed weapon rides) and layer 2 (waist) live in the files
+    right after it. Posing ``idl`` from the body DAT alone leaves the arms at bind, so
+    pass these as clip sources too. The base itself is left out: it is the skeleton DAT.
+    """
+    bases = _cached_category_bases().get('movement')
+    if not bases:
+        return ()
+    base = bases[race_index(race)]
+    resolver = _cached_resolver()
+    specs: List[str] = []
+    for file_id in range(base + 1, base + _MOVEMENT_COMPANIONS + 1):
+        spec = resolver.rom_spec(file_id)
+        if spec and spec not in specs:
+            specs.append(spec)
+    return tuple(specs)
+
+
+def battle_motion_spec(race, weapon_animation_type: int) -> Optional[str]:
+    """ROM spec of the engaged-motion pack for a weapon type on a race, or None.
+
+    The client adds a weapon DAT's ``weaponAnimationType`` (info byte 3) to the race's
+    battle base to pick the pack holding that weapon's ``btl`` stance and attack clips —
+    the two-handed grip of a great sword is in that pack, not in the weapon mesh.
+    """
+    bases = _cached_category_bases().get('battle')
+    if not bases:
+        return None
+    return _cached_resolver().rom_spec(bases[race_index(race)] + int(weapon_animation_type))
 
 
 def weapon_skill_slot(banks: Dict[str, WsBank], race, animation: int) -> WsSlot:
