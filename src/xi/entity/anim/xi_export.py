@@ -110,12 +110,26 @@ class Joint:
     parent_index: int
     rotation: Tuple[float, float, float, float]
     translation: Tuple[float, float, float]
+    # Bind scale is always unit; a posed frame carries the clip's scale keys. The client
+    # sizes weapons this way: every race wields the same weapon mesh, and each race's
+    # clips scale the grip joint (Tarutaru ~0.5-0.7, Galka ~1.2-1.35).
+    scale: Tuple[float, float, float] = (1.0, 1.0, 1.0)
 
 
 @dataclass
 class JointGlobal:
     rotation: Tuple[float, float, float, float]
     translation: Tuple[float, float, float]
+    # Accumulated down the hierarchy per axis — exact for the uniform scales the clips
+    # key on the joints that carry geometry.
+    scale: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+
+UNIT_SCALE = (1.0, 1.0, 1.0)
+
+
+def is_unit_scale(scale: Tuple[float, float, float]) -> bool:
+    return all(abs(c - 1.0) < 1e-6 for c in scale)
 
 
 @dataclass
@@ -680,8 +694,7 @@ def pose_joints_at_frame(joints: List[Joint], animation: "AnimationSection", fra
     exporter poses it: ``local_rotation = trackRotation ⊗ bindRotation`` and
     ``local_translation = bindTranslation + trackTranslation``. Untracked joints
     keep their bind transform. ``frame`` is clamped to the animation's range.
-    NOTE: animation bone SCALE is not applied (rigid bake; FFXI idles use unit
-    scale) — fine for posing the mesh to match an in-game/Noesis idle frame.
+    The track's scale key becomes the joint's local scale.
     """
     if animation.num_frames <= 0:
         return list(joints)
@@ -694,8 +707,10 @@ def pose_joints_at_frame(joints: List[Joint], animation: "AnimationSection", fra
             continue
         local_rotation = quat_normalize(quat_mul(track.rotations[f], joint.rotation))
         local_translation = add_vec3(joint.translation, track.translations[f])
+        local_scale = track.scales[f] if f < len(track.scales) else joint.scale
         posed.append(Joint(index=joint.index, parent_index=joint.parent_index,
-                           rotation=local_rotation, translation=local_translation))
+                           rotation=local_rotation, translation=local_translation,
+                           scale=tuple(local_scale)))
     return posed
 
 
@@ -769,7 +784,9 @@ def normalize_vec3(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
 
 def apply_parent_overrides(joints: Sequence[Joint], parent_overrides) -> List[Joint]:
     """Re-parent joints per ``{joint_index: new_parent_index}``, giving each an identity
-    local transform — the client's "adopt the new parent wholesale".
+    local rotation and translation — the client's "adopt the new parent wholesale".
+    The joint keeps its own scale: the clips key a different grip scale for the engaged
+    stance than for the stowed one, which only matters if it survives the re-parent.
 
     Rewriting the HIERARCHY, not just the world transforms, is what makes the change
     survive export. A glTF file stores the node tree and the inverse-bind matrices
@@ -797,7 +814,8 @@ def apply_parent_overrides(joints: Sequence[Joint], parent_overrides) -> List[Jo
             out.append(joint)
             continue
         out.append(Joint(index=joint.index, parent_index=new_parent,
-                         rotation=(0.0, 0.0, 0.0, 1.0), translation=(0.0, 0.0, 0.0)))
+                         rotation=(0.0, 0.0, 0.0, 1.0), translation=(0.0, 0.0, 0.0),
+                         scale=joint.scale))
     return out
 
 
@@ -823,11 +841,14 @@ def compute_global_transforms(joints: Sequence[Joint], parent_overrides=None) ->
     def place(joint: Joint, parent: Optional[JointGlobal]) -> None:
         local_rot = quat_normalize(joint.rotation)
         if parent is None:
-            globals_out[joint.index] = JointGlobal(rotation=local_rot, translation=joint.translation)
+            globals_out[joint.index] = JointGlobal(rotation=local_rot, translation=joint.translation,
+                                                   scale=joint.scale)
         else:
+            scaled = tuple(parent.scale[i] * joint.translation[i] for i in range(3))
             globals_out[joint.index] = JointGlobal(
                 rotation=quat_normalize(quat_mul(parent.rotation, local_rot)),
-                translation=add_vec3(parent.translation, rotate_vec3(parent.rotation, joint.translation)),
+                translation=add_vec3(parent.translation, rotate_vec3(parent.rotation, scaled)),
+                scale=tuple(parent.scale[i] * joint.scale[i] for i in range(3)),
             )
 
     if not parent_overrides and not forward_parent:
@@ -844,7 +865,11 @@ def compute_global_transforms(joints: Sequence[Joint], parent_overrides=None) ->
             override = parent_overrides.get(joint.index) if parent_overrides else None
             if override is not None:
                 if done[override]:
-                    globals_out[joint.index] = globals_out[override]   # adopt the hand wholesale
+                    # Adopt the hand wholesale, keeping the grip's own scale on top.
+                    hand = globals_out[override]
+                    globals_out[joint.index] = JointGlobal(
+                        rotation=hand.rotation, translation=hand.translation,
+                        scale=tuple(hand.scale[i] * joint.scale[i] for i in range(3)))
                     done[joint.index] = True
                     progressed = True
                 else:
@@ -940,10 +965,11 @@ def pose_joints_at_playback_frame(joints: List[Joint], animation: "AnimationSect
         if track is None or not track.rotations:
             posed.append(joint)
             continue
-        rotation, translation, _scale = sample_track(track, animation.keyframe_duration, f)
+        rotation, translation, scale = sample_track(track, animation.keyframe_duration, f)
         posed.append(Joint(index=joint.index, parent_index=joint.parent_index,
                            rotation=quat_normalize(quat_mul(rotation, joint.rotation)),
-                           translation=add_vec3(joint.translation, translation)))
+                           translation=add_vec3(joint.translation, translation),
+                           scale=tuple(scale)))
     return posed
 
 
@@ -984,12 +1010,16 @@ def resolve_corner_vertex(vertex: VertexSource, globals_by_joint: Sequence[Joint
     # The previous code did ``weight0*pos0 + weight1*pos1`` over the full transform,
     # which double-weighted the rotated position and collapsed every 2-joint vertex
     # (the torso) — verified against the Noesis reference (mean error 1.22 -> 0.0).
+    # A joint's accumulated scale sizes what hangs off it (p_i is joint-local, so it
+    # scales before the rotation); normals stay unit and so ignore it.
     g0 = globals_by_joint[joint0]
+    p0 = tuple(g0.scale[i] * p0[i] for i in range(3))
     pos0 = add_vec3(mul_vec3(g0.translation, vertex.weight0), rotate_vec3(g0.rotation, p0))
     norm0 = rotate_vec3(g0.rotation, n0)
 
     if vertex.weight1 > 0.0:
         g1 = globals_by_joint[joint1]
+        p1 = tuple(g1.scale[i] * p1[i] for i in range(3))
         pos1 = add_vec3(mul_vec3(g1.translation, vertex.weight1), rotate_vec3(g1.rotation, p1))
         norm1 = rotate_vec3(g1.rotation, n1)
         position = add_vec3(pos0, pos1)

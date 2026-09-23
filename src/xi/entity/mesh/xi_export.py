@@ -30,6 +30,7 @@ from xi.entity.anim.xi_export import (
     compute_global_transforms,
     compute_min_max_vec3,
     choose_animation,
+    is_unit_scale,
     pack_u16_vec4,
     pack_vec2,
     pack_vec3,
@@ -40,8 +41,12 @@ from xi.entity.anim.xi_export import (
     parse_sections,
     parse_skeleton,
     pose_joints_at_frame,
+    quat_conjugate,
+    quat_mul,
+    quat_normalize,
     resolve_corner_vertex,
     rigid_inverse_matrix,
+    rotate_vec3,
 )
 from xi.xi_config import BLENDER_PATH, XI_TOOLS_DIR, FFXI_DIR, SCHEMA_GENERATION, read_path_for
 from xi.utils.xi_core import DEFAULT_ALPHA_SCALE, encode_png_rgba, scale_alpha
@@ -378,6 +383,20 @@ def write_glb(gltf: dict, bin_data: bytes, path: Path) -> None:
     path.write_bytes(bytes(out))
 
 
+def _rigid_local(joint: Joint, globals_by_joint: List[JointGlobal]) -> Joint:
+    """``inv(parentGlobal) ∘ global`` on rotation and translation only."""
+    g = globals_by_joint[joint.index]
+    if joint.parent_index < 0:
+        return Joint(index=joint.index, parent_index=joint.parent_index,
+                     rotation=g.rotation, translation=g.translation)
+    p = globals_by_joint[joint.parent_index]
+    inv = quat_conjugate(p.rotation)
+    delta = tuple(g.translation[i] - p.translation[i] for i in range(3))
+    return Joint(index=joint.index, parent_index=joint.parent_index,
+                 rotation=quat_normalize(quat_mul(inv, g.rotation)),
+                 translation=rotate_vec3(inv, delta))
+
+
 def build_gltf(
     dat_path: Path,
     output_dir: Path,
@@ -556,6 +575,12 @@ def build_gltf(
                 _emit_primitive(positions, normals, texcoords, joints0, weights0,
                                 colors if has_color else [], tri_indices, primitive.material_name)
 
+    # A posed frame's joint scale is baked into the vertices above, so the skeleton is
+    # written rigid: the inverse-bind matrices ignore scale (a hidden mount keys 0, which
+    # no matrix could invert), and each node's local is re-solved from the globals so
+    # the node tree lands every joint exactly where the vertices were baked against.
+    if not all(is_unit_scale(g.scale) for g in globals_by_joint):
+        joints = [_rigid_local(joint, globals_by_joint) for joint in joints]
     inverse_bind_matrices = [rigid_inverse_matrix(g.rotation, g.translation) for g in globals_by_joint]
     inverse_bind_accessor = builder.add_accessor(pack_mat4(inverse_bind_matrices), 5126, "MAT4", len(inverse_bind_matrices))
 

@@ -30,7 +30,7 @@ onto the bow hand and brings it into the export.
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from os.path import commonprefix
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -47,6 +47,7 @@ from xi.entity.anim.xi_export import (
     SECTION_TYPE_SKELETON_MESH,
     AnimationSection,
     AnimationTrack,
+    UNIT_SCALE,
     Joint,
     JointGlobal,
     Section,
@@ -151,6 +152,35 @@ def _lowest_weighted_joint(source: PoseSource) -> Optional[int]:
                 if joint is not None and joint > 0 and (lowest is None or joint < lowest):
                     lowest = joint
     return lowest
+
+
+def _unhide_drawn_ranged(joints: List[Joint], sources: List[PoseSource],
+                         overrides: dict) -> List[Joint]:
+    """Lift the zero scale a clip keys on a ranged weapon's joints once it is drawn.
+
+    Scale ~0 (keyed as 1e-5) is how the client hides a stowed ranged weapon. Drawing one
+    is our choice, not the client's, so the joints between its mesh and its mount get
+    unit scale in place of ~0; any other scale (the race's weapon size) is kept."""
+    chain = set()
+    for source in (s for s in sources if s.slot == "ranged"):
+        mount = _lowest_weighted_joint(source)
+        if mount not in overrides:
+            continue
+        for section in source.sections:
+            if section.type_code != SECTION_TYPE_SKELETON_MESH:
+                continue
+            vertices, _ = parse_mesh(source.data, section)
+            for joint in {v.joint_index0 for v in vertices} | {v.joint_index1 for v in vertices if v.weight1 > 0.0}:
+                seen = set()
+                while 0 <= joint < len(joints) and joint not in seen:
+                    seen.add(joint)
+                    chain.add(joint)
+                    if joint == mount:
+                        break
+                    joint = joints[joint].parent_index
+    return [replace(j, scale=UNIT_SCALE)
+            if j.index in chain and all(abs(c) < 1e-3 for c in j.scale) else j
+            for j in joints]
 
 
 def _weapon_overrides(sources: List[PoseSource], references, draw_ranged: bool,
@@ -436,6 +466,8 @@ def build_pose(sources: List[PoseSource], output_dir: Path, name: str = "pose",
         # tree — an override applied only to the globals looks right in the baked vertex
         # positions and then slides the weapon back off the hand once the file is opened.
         overrides, weapon_notes = _weapon_overrides(sources, references, draw_ranged, draw_melee)
+        if draw_ranged:
+            joints = _unhide_drawn_ranged(joints, sources, overrides)
         joints = apply_parent_overrides(joints, overrides)
         globals_by_joint = compute_global_transforms(joints)
 
