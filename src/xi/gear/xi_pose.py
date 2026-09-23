@@ -478,11 +478,13 @@ def build_pose(sources: List[PoseSource], output_dir: Path, name: str = "pose",
         # zero because nothing animates its back-mount bone. Drawn into the export, it
         # would hang at the character's feet in its bind pose.
         render = source.slot != "ranged" or draw_ranged
+        # Keyed by offset, not name: a DAT can hold distinct meshes under one name — a
+        # bow and its arrow are both "wep2", and some bodies split into two "hh_b".
         seen = set()
         for section in source.sections:
-            if section.type_code != SECTION_TYPE_SKELETON_MESH or section.name in seen:
+            if section.type_code != SECTION_TYPE_SKELETON_MESH or section.start in seen:
                 continue
-            seen.add(section.name)
+            seen.add(section.start)
             parts.append(_MeshPart(source, section, mesh_occlude_type(source.data, section),
                                    render=render))
     if not parts:
