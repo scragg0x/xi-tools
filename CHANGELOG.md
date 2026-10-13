@@ -6,12 +6,182 @@ point at the GitHub compare view for anyone who wants the technical detail.
 
 ---
 
-## Unreleased
+## v1.15.0 — 2026-09-29
 
-[Compare v1.8.1...main](https://github.com/vekien/xi-tools/compare/v1.8.1...main)
+[Compare v1.14.0...v1.15.0](https://github.com/vekien/xi-tools/compare/v1.14.0...v1.15.0)
 
-- **`xi anim export --split-anim`** writes every animation track in a DAT as its own file named after the track (`exports/anim/rom/27/82/idl0.gltf`, `wlk0.gltf`, …) instead of one `--anim` clip; with `--fbx` the lot is baked through a single Blender run
-- **`xi anim export --categories`** lays the output out as `<race>/<category>/<action>/` — `exports/anim/hume_male/sword/fast_blade/`, `galka/emote/emote/` — named from the viewer's character list with the FFXiMain.dll motion tables as the fallback; DATs neither knows (monsters, NPCs) go under `other/`. Works for a single DAT and for the no-DAT bulk export. The same lookup now also detects the race of animation-only DATs the ROM-id heuristic didn't know (weapon skills, job emotes, battle packs), so those export without `--race`
+**Export: texture alpha**
+
+- DXT3 textures came out with their alpha rows swapped in pairs inside every 4×4 block (a bug carried over from xim's decoder). Colour was right, so most textures looked fine, but one whose picture lives in its alpha — water and effect textures such as West Sarutabaruta's `ike2` — was streaked with fine horizontal lines, most visible zoomed out. Fixed for everything that writes textures: zone export (and `--unreal`), mesh, gear and pose, effects, animation and batch. Re-export to pick it up.
+
+**dats**
+
+- New zone action types, each recording what it changed so a rebuild converges and `undo` is exact: `zone_dialog` (lines by id in a zone's English and Japanese dialog tables), `zone_npcs` (renames and new NPCs in the entity-name table, each row as proposed SQL) and `zone_events` (cutscenes and dialogues compiled into the zone's event table, lint-checked first; a camera gets its own scene DAT). `xi event cutscene compile` and `xi event dialogue new` are now prepare + build, and the zone editor's Publish / Delete go through them.
+- A build applies a project's table edits to the tables as they are: whatever an edit names is replaced, and `undo` still puts it back. `--reset` first puts every table the project edited back to its `.base`. `--list` builds a build list (`projects/build_list.json`, [`schema/build_list.json`](schema/build_list.json)): several projects in order, every table they edit reset once first with `--reset`.
+- `like` is now `copy_from`; an action that still says `like` is refused and says so.
+- The CatsEyeXI item band is gone: any item table can be named by its ROM path with the layout of its records. `xi ui items custom` is now `xi ui items monstrosity` (`custom` still works).
+
+**database**
+
+- The spell and ability records of `ROM/118/114.DAT` (`spellData`, `abilityData`: MP, cast and recast, element, skill, job levels; TP, range, AoE), by field, `copy_from` or growth; a spell edit proposes its `spell_list` row. `xi mv database` bakes them for the viewer.
+- `hex` writes a whole record exactly; a d_msg table can be named by its ROM path; the help tables' `help` sub-string and the Japanese key item and status names can be edited. `zone_dialog` takes `entry_hex`, a line's whole entry.
+- `xi database grow TABLE COUNT` grows a d_msg or item table to a fixed size once, as `xi ftable expand` does for the file tables (its `.base` too, so a reset keeps the rows): new d_msg rows blanked to `.`, item rows copies of the last placeholder, or `--fill-from ROW` / `--fill-hex`.
+
+**Events**
+
+- `xi event decompile` lists every NPC an event involves, and an unedited recompile changes only the owner's block (Maat's event had been dropping three NPCs and rewriting 27 lines).
+
+## v1.14.0 — 2026-09-25
+
+[Compare v1.13.0...v1.14.0](https://github.com/vekien/xi-tools/compare/v1.13.0...v1.14.0)
+
+**Zone export for Unreal (`--unreal`)**
+
+- Trees, grass, signs and grates are split by triangle: the see-through parts (leaves, grass blades) keep the `_cutout` material and the solid parts (trunks, posts, bark-textured branch cards) move to the plain one. Turn wind on for a tree's `_cutout` instance and the trunk stays still; far fewer triangles are masked (West Ronfaure: 2,250 → 767).
+- Wind weights: every mesh gets a second UV channel, height (`x`) and reach from the centre (`y`) within the mesh, 0 on anything solid. Weight MasterMaterial's `SimpleGrassWind` by `TexCoord[1]` and grass roots stop sliding.
+- One PNG per texture: no more `_opaque.png` copies. Solid and cutout materials share the texture, and `ffxi_zone_setup.py` compresses the ones only solid materials use without alpha. Plain `--fbx` still writes the copies, for Blender.
+- Not yet checked in Unreal itself: the wind channel arriving through the FBX import, and the compression pass. Re-export zones to pick all of this up.
+
+**Abilities**
+
+- The job-ability animation band starts at 1024, above the warp and teleport effects at 596–656, matching cexislots v1.14 (#14). Nothing already published changes file id.
+- The animation bands always follow xi-tools' own numbers: `FX_*_BAND_*` lines in `.env` are ignored (a real environment variable still sets them). Asking for a job-ability number in the gap (500–1023) now says why and which ranges to pick from.
+
+**Docs**
+
+- [`unreal-engine/foliage.md`](unreal-engine/foliage.md): trunk vs leaf materials, wiring the wind, and why leaf normals face down (the game files are made that way). [`materials.md`](unreal-engine/materials.md), the kit README, troubleshooting and [`docs/zone/export.md`](docs/zone/export.md) follow; [`docs/ability/mixer.md`](docs/ability/mixer.md) for the bands.
+
+## v1.13.0 — 2026-09-25
+
+[Compare v1.12.0...v1.13.0](https://github.com/vekien/xi-tools/compare/v1.12.0...v1.13.0)
+
+**Zone export**
+
+- `--objects` and `--sub-areas` work together: the zone's objects go in the output folder and each sub-area's in a `<stem>_<id>/` folder beside them (Lower Jeuno: `41_454/` … `41_466/`), each with its own PNGs, so a mesh name a sub-area shares with the zone can't overwrite it.
+- `--objects` now writes `--collision` too; it used to skip it.
+- `--zero-coords` — every FBX imports at location 0,0,0 with no rotation, for placing pieces by hand or from the JSON: transforms are baked into the geometry and each file (zone, sub-area, object) is moved so the centre of its base is on the origin. Implies `--json`, which gains `fbx_zero_coords`: each file's offset and, per object, every placement's transform (4x4 plus location / rotation / scale). `--zero-cords` works too.
+- `--json` lists each sub-area with its own placements, in the zone's world space, and follows a schema, [`schema/zone_export.json`](schema/zone_export.json) (`xi.zone-export.v1`), with a validator in `xi.zone.xi_zone_json`.
+- The `--objects` docs said the files went in a `<stem>_objects/` folder; they go straight into the output folder, and now say so.
+
+**Mesh export and gear pose**
+
+- `--zero-coords` — the FBX's armature and mesh import at 0,0,0 with no rotation: the orientation fix is baked in instead of a rotated root. The skeleton root stays the origin, and an `--all-frames` clip plays as before.
+
+**dats**
+
+- New `database` action: edit or add records in the client's tables — items, key items, titles, quest and mission logs, spell and ability text — by table and id, with the viewer's field names. English and Japanese records, legacy or retail DATs; `like` copies another record into an empty slot; `undo` puts them back. An item edit can carry its server rows, written as proposed SQL to `<project>.sql` (never run). `dats new` has a "Database records" wizard, and `dats prepare edits.json --project P [--merge]` is the scripted way in. See [`docs/database/README.md`](docs/database/README.md).
+- Includes: an `actions` entry can be the path of an include file ([`schema/include.json`](schema/include.json)) whose actions are spliced in at that spot, so one project can keep its gear, record edits and events in separate files. A build writes each result back to the file its action came from.
+
+**Docs**
+
+- [`docs/zone/export.md`](docs/zone/export.md): Zero coords, per-object export with sub-areas; [`subareas.md`](docs/zone/subareas.md), [`mesh/export.md`](docs/mesh/export.md), [`gear/pose.md`](docs/gear/pose.md) and the [`unreal-engine/`](unreal-engine/README.md) kit mention the new options.
+- [`docs/gear/model_ids.md`](docs/gear/model_ids.md): gear model id → file id — the DLL group walk, the custom window formula, retail and patched ceilings.
+
+## v1.12.0 — 2026-09-24
+
+[Compare v1.11.0...v1.12.0](https://github.com/vekien/xi-tools/compare/v1.11.0...v1.12.0)
+
+**Zone export**
+
+- `--sub-areas` — also export each sub-area from its own DAT as `<stem>_<id>` beside the zone: Lower Jeuno (`ROM/1/41`) gives `41` plus `41_454` … `41_466`, one per shop interior; Ru'Aun Gardens one per island platform, at full detail. The zone file leaves out the stand-ins those sub-areas replace, and texture names the sub-areas reuse for other pixels get their own PNG.
+- `--no-subareas` is described for what it drops: the low-detail stand-ins a zone draws for each sub-area until you enter it, not the sub-areas themselves.
+- Sub-area file ids follow the client (FFXiMain.dll `0x10177850`): the high range starts at id `0x258`, not xim's `0x271`. No zone has an id in between, so nothing resolves differently today.
+
+**Docs**
+
+- [`docs/zone/subareas.md`](docs/zone/subareas.md): sub-areas carry detail as well as interiors (Ru'Aun Gardens' 16 island platforms), how a sub-area DAT borrows the zone's textures, every zone that has sub-areas (282 in 30 zones), and how the export and the XI Model Viewer handle them.
+- [`docs/ffximain/ffximain.md`](docs/ffximain/ffximain.md): the client's sub-area file-id function.
+- [`docs/zone/format.md`](docs/zone/format.md) and [`lod-draw-distance.md`](docs/zone/lod-draw-distance.md): the `+0x50` link is a stand-in, and far copies are told apart by the culling tables.
+
+## v1.11.0 — 2026-09-24
+
+[Compare v1.10.0...v1.11.0](https://github.com/vekien/xi-tools/compare/v1.10.0...v1.11.0)
+
+**Unreal Engine**
+
+- New [`unreal-engine/`](unreal-engine/README.md) kit for FFXI zones in UE 5.6: recommended export args, FBX import settings, the materials (`MasterMaterial` plus decal / wall / translucent overlay materials) and `ffxi_zone_setup.py`, a select-all › Execute Python Script pass that sorts each zone's overlays onto the right material. Docs cover how FFXI draws a zone and what each part becomes in UE.
+
+**Zone export**
+
+- `--unreal` — one flag for an Unreal FBX: right-handed, opaque materials, raw vertex colours. Use `--unreal --no-sky --no-vfx`.
+- `--vertex-color raw|baked` — `raw` keeps the DAT's own colours and vertex alpha for an engine material to apply FFXI's ×2; `baked` (default) folds it in for shaderless viewers.
+- Raw vertex colours go into the FBX as linear, not sRGB, so the neutral 0.5 arrives as 0.5.
+- `_opaque.png` texture twins are written byte-identical; Blender no longer tone-maps them darker.
+- `--unreal` drops hidden duplicate opaque triangles (two textures at one spot showed as a stray wrong-textured triangle in UE).
+- `--alpha-split-mesh` — **(Test) Alpha Split Mesh**. Exports two FBX files, `<stem>.fbx` (opaque base) and `<stem>_A.fbx` (the alpha-blend ground decals, separated out). `--decal-offset` and `--decal-smooth-angle` tune the lift and smoothing. Superseded for Unreal by the `unreal-engine/` materials: its auto-smooth draws shading creases.
+
+## v1.10.0 — 2026-09-21
+
+[Compare v1.9.0...v1.10.0](https://github.com/vekien/xi-tools/compare/v1.9.0...v1.10.0)
+
+**Server**
+
+- DB credentials come from xi-tools `.env` only (`XI_DB_*`). `settings/network.lua` is no longer read.
+- `xi server check` — read-only report of the local server setup.
+- `xi server ws-widen` — writes the C++ patch and SQL for weapon-skill animations above 255. Does not edit the checkout.
+
+**Ability publish**
+
+- `dats build` / `ability publish` can `--apply-db`, `--menu-record`, and `--lua-stub` after placing DATs.
+- `dats undo --apply-db` reverts the server row, menu record, and Lua stub.
+- Mix files are `*.mix.json` (old `*.recipe.json` still builds).
+- Each publish writes `projects/abilities/<slug>/` (SQL, DAT copies, `placements.json`).
+- Publish SQL no longer overwrites `animationTime`.
+
+**Compose**
+
+- Recipe events can add locks, hits, and links by hand (`raw`, no `from`).
+- Recipe can edit generators/curves and replace a texture with a PNG.
+- Weapon skills compose in retail folder layout.
+- Emote-as-weapon-skill writes companion DATs (waist) and stows the weapon.
+- Base motions list their stages. Looped clips wait out every cycle.
+- Fixes:
+  - Custom-band WS race index was off by one (Hume male loaded Hume female). **Republish** custom weapon skills.
+  - Shared-routine links keep their name. Compose warns about a link the game will not find.
+  - Lane collisions no longer steal a lane's own names or the other lane's textures.
+  - Compose carries the texture a mesh actually draws.
+
+**Other**
+
+- `xi fx set --color` writes RGB, not BGR. Recolour any DAT set with the old flag.
+- `xi ability inspect` names more opcodes.
+- Docs: elevators, doors, weapon-skill effect-folder names.
+
+---
+
+## v1.9.0 — 2026-09-18
+
+[Compare v1.8.1...v1.9.0](https://github.com/vekien/xi-tools/compare/v1.8.1...v1.9.0)
+
+Ability Mixer: mix retail job abilities, spells, and weapon skills into a new one.
+
+**Ability mixer**
+
+- `xi ability inspect` / `recipe` / `compose` / `publish`. Recipes are `xi.ability.v1` JSON.
+- Publish is an `xi dats` action. `xi ability publish` is prepare + build.
+- Pick list is `xi mv update --only abilities`.
+- Per-race motion for weapon skills. JA/spell use the race-base `base_motions` list (baked unique motion is experimental).
+- Custom animation bands on by default (cexislots). `--animation-from N`, `xi ability slots`.
+- `dats build --pivot` grows the pivot ROM10 tables for band file ids.
+
+**dats / pivot**
+
+- `--pivot` writes `FFXI_PIVOT_DIR` only when asked.
+- File ids resolve like the client (`ROM{n}` pair, then install main pair).
+- A pivot build registers a file id; it does not raise the ceiling — run `xi ftable expand` on the install.
+- Spell/command menu records. Dry run treats retail placeholders as free.
+
+**Export**
+
+- `xi zone export` welds by default. `--weld-seams` (with `--fbx`) joins UV seams.
+- `--right-handed` is correct in Unreal, Unity, and Godot.
+- `xi anim export --split-anim` (one file per track) and `--categories` (`<race>/<category>/<action>/`).
+
+**Fixes / lists**
+
+- `xi fx copy` and compose follow particle meshes and sprite sheets to their textures.
+- A composed routine with no total ends at its last window.
+- MV lists refreshed from the 10 Sept 2026 client. Lists are validated before publish.
 
 ---
 
@@ -21,12 +191,10 @@ point at the GitHub compare view for anyone who wants the technical detail.
 
 Hotfix for the 10 September 2026 retail update.
 
-- **Item DATs from the 10 September 2026 retail update decode again.** That update grew every item record from `0xC00` to `0x1400` bytes and widened the header (`flags` became a u32; the equipment layouts gained a pad after `races`), so anything that assumed `0xC00` read nothing from a patched client. The record stride is now detected per file (`xi.ui.items.xi_layout`) and every field offset is looked up for that file's format, so `xi ui items search/export/json/import/inject/icon` and `xi mv database` work unchanged against a legacy install and a current retail one — even side by side. New `xi ui items info` lists each item DAT with the format it detected. Import and inject write records in the DAT's own format; the string block they write now matches the client's real layout (text objects with the `0x1C` header, a number object for the article slot) instead of a packed form only this tool could read
-- New item table `ROM/387/13–14` (ids 30720–31743, `Items_7`) registered in the item CLI and the `xi mv database` registry (`items7`); skipped where it does not exist
-- `xi mv database` item documents carry `stride`, `strides` and `format`
-- Model-viewer lists: the Colibri Scythe (main-hand model 969, `ROM/387/15–21`, one DAT per race) added to `characters.json` for all seven races; `manifest.json` regenerated
-- Tests: `tests/test_items_layout.py` (no game files needed — synthetic records in both formats round-trip and the detector tells them apart) and `tests/test_items_reference.py` (Scorpion Harness, Kraken Club, Byakko's Haidate, Excalibur, Chocobo Bedding decode identically from a legacy and a retail install; set `FFXI_RETAIL_DIR` / `FFXI_LEGACY_DIR`, either may be absent)
-- Docs: `docs/retail/update_september_10_2026.md` — every DAT the update touched, what each one is, the record-format change field by field, the verified zone file-id formulas, and the item / dialog / event / Ambuscade content diff
+- Item records grew from `0xC00` to `0x1400`. Stride is detected per file; `xi ui items` and `xi mv database` work on both formats.
+- New `xi ui items info`. New item table `ROM/387/13–14` (`Items_7`).
+- Colibri Scythe added to `characters.json`.
+- Docs: `docs/retail/update_september_10_2026.md`.
 
 ---
 
@@ -34,8 +202,8 @@ Hotfix for the 10 September 2026 retail update.
 
 [Compare v1.7.0...v1.8.0](https://github.com/vekien/xi-tools/compare/v1.7.0...v1.8.0)
 
-- **`xi zone export --opaque`** — solid materials the way the client draws them
-- **Lists:** the Beasts > Rabbit row that pointed at an Elvaan Bishop (`ROM/3/108`, a typo for `ROM/4/108`) and the "Phanauet Channel - 1" map row that was an NPC model are gone, along with 170 effect rows that could never play — four-byte stubs, empty shells, zone files, and the four 2009 add-on categories whose effect index had been resolved as an absolute file id. `manifest.json` regenerated, so the viewer picks the lists up at boot
+- `xi zone export --opaque` — solid materials the way the client draws them.
+- Lists: dropped the Rabbit→Elvaan Bishop typo, a Phanauet map row that was an NPC, and 170 unplayable effect rows.
 
 ---
 

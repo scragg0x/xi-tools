@@ -12,6 +12,9 @@ and a UE5 engine port where they confirm or clarify format details.
 
 > **Note:** Includes documentation on `xi-tools`, which is not yet publicly released — but the format information is accurate and useful for research.
 
+> **Contributing (people or AI):** read [DESIGN.md](../DESIGN.md) first. Every feature is
+> documented here, in the same PR as its code (DESIGN.md §11).
+
 ---
 
 ## Table of Contents
@@ -86,9 +89,10 @@ the `0x07` scheduler that cutscenes use to drive character motion.
 | [anim/emotes.md](anim/emotes.md) | Emote & skeleton-less DATs: base skeleton, overlay slots, routine duration |
 | [anim/quickref.md](anim/quickref.md) | One-page cheatsheet of common export/import/layer commands |
 | [anim/fishing.md](anim/fishing.md) | Fishing rods & hand props: the client's per-race rod table, rod DATs, dependent-actor playback, the logging hatchet, and how `xi mv update` / the viewer reproduce them |
-| [anim/weapon-skills.md](anim/weapon-skills.md) | Weapon-skill animations: the three unrelated id spaces, the primary (0–255) and extended (256–271) per-race motion banks with their companion blocks, the rotated ability table, the name table, the effect-directory naming pattern and its counterexamples, `xi anim ws` |
+| [anim/weapon-skills.md](anim/weapon-skills.md) | Weapon-skill animations: the three unrelated id spaces, the primary (0–255) and extended (256–271) per-race motion banks with their companion blocks, the rotated ability table, the name table, the effect-directory naming pattern (family + position, not hex) and its counterexamples, the body DAT's folders, `xi anim ws` |
 | [ability/inspect.md](ability/inspect.md) | `xi ability inspect`: flatten an ability's `0x07` routine graph (job ability / spell / weapon skill / any DAT) into one absolute-frame timeline of motion, VFX and sound |
 | [ability/mixer.md](ability/mixer.md) | `xi ability recipe` / `compose` / `publish` (an `xi dats` ability action) and the `abilities` list target: build a new ability from pieces of retail ones, install it in ROM10, and the viewer's Ability Mixer mode that drives them |
+| [menu/records.md](menu/records.md) | The `spell` / `command` actions of `xi dats`: add a new spell or job-ability id to the client's menu tables (`ROM/118/114.DAT` records + `ROM/181` names/help) above the retail band; record layouts, the client's ceilings, `xi ui spells` |
 
 ---
 
@@ -105,7 +109,7 @@ and per-object mesh (0x2A) import/export.
 | [zone/import-json.md](zone/import-json.md) | JSON change-set format used by the web level editor |
 | [zone/collision.md](zone/collision.md) | Player-collision mesh (MZB): format, export, adding blockers |
 | [zone/navmesh.md](zone/navmesh.md) | Server navmesh (`.nav`): bake from collision via Recast/Detour |
-| [zone/subareas.md](zone/subareas.md) | Client-side sub-areas (shop interiors): how they work |
+| [zone/subareas.md](zone/subareas.md) | Client-side sub-areas (shop interiors, Ru'Aun's island platforms): how they work, every zone that has them, `zone export --sub-areas` |
 | [zone/inject-legacy.md](zone/inject-legacy.md) | Legacy injection path |
 | [zone/lod-draw-distance.md](zone/lod-draw-distance.md) | LOD and draw-distance mechanics |
 | [zone/reset.md](zone/reset.md) | Restoring a zone DAT to pristine state |
@@ -134,6 +138,7 @@ reference, camera handling, and a cutscene authoring guide.
 | [events/opcodes.md](events/opcodes.md) | Complete event-VM opcode reference (0x00–0xD9) |
 | [events/cutscenes.md](events/cutscenes.md) | How a scripted scene plays: trigger → run → release, camera, resource graph |
 | [events/authoring.md](events/authoring.md) | Authoring custom cutscenes and NPC dialogue events; the `xi.cutscene.v1` JSON step vocabulary; `explain` / `survey` / `lint` / `npc` |
+| [events/zone_events.md](events/zone_events.md) | The `zone_events` dats action: cutscenes and dialogues compiled into a zone's event + EN/JP dialog tables, camera scene DATs, recorded and undone exactly |
 | [events/retail-events.md](events/retail-events.md) | Decompile any retail event to JSON, edit it, recompile byte-exact; `sweep` proves whole zones |
 | [events/typed_opcodes.md](events/typed_opcodes.md) | The typed opcode table the decompiler and compiler share |
 | [events/cutscene-dev-guide.md](events/cutscene-dev-guide.md) | Browser editor + compile pipeline for custom cutscenes |
@@ -159,6 +164,8 @@ the event DAT that triggers it.
 |-----|---------|
 | [dialog/format.md](dialog/format.md) | Container format: 24-bit length, XOR-`0x80`, offset table, `0x7F` prompt codes |
 | [dialog/export.md](dialog/export.md) | Decoding to JSON: text, opcodes, hex |
+| [zone/zone_npcs.md](zone/zone_npcs.md) | The `zone_npcs` dats action: rename or add a zone's NPCs (name table + proposed `npc_list` SQL) |
+| [dialog/zone_dialog.md](dialog/zone_dialog.md) | The `zone_dialog` dats action: edit or add a zone's dialog lines by id, EN + JP, recorded and undone exactly |
 | [dialog/edit.md](dialog/edit.md) | Authoring custom dialog: `\n`, `\v`, `{player}`, `{npc}`, faithful rebuild |
 
 ---
@@ -206,6 +213,8 @@ from `FFXiMain.dll`.
 | Doc | Summary |
 |-----|---------|
 | [gear/json.md](gear/json.md) | All gear model entries across races and slots |
+| [database/README.md](database/README.md) | The `database` dats action: edit or add item / key item / title … records by table and id (or any table by ROM path), EN + JP, legacy or retail DATs, with proposed server SQL; `xi database grow` |
+| [gear/model_ids.md](gear/model_ids.md) | Gear model id → file id: the DLL group walk, the custom window formula, retail and patched ceilings |
 | [gear/export.md](gear/export.md) | Gear mesh export |
 | [gear/pose.md](gear/pose.md) | `xi gear pose`: a whole dressed character (every slot + weapons) as one GLB/FBX, with the geometry the worn set hides removed |
 | [gear/import.md](gear/import.md) | Gear mesh import |
@@ -236,6 +245,7 @@ Commands live under `xi ui tex …` and `xi ui layout …`.
 
 | Doc | Summary |
 |-----|---------|
+| [tex/normals.md](tex/normals.md) | `xi tex normals` — name normal maps for VanaCore texture packs from a `tex_debug` dump |
 | [ui/export.md](ui/export.md) | `xi ui tex export` / `sx` — extract textures from a UI DAT |
 | [ui/import.md](ui/import.md) | `xi ui tex import` / `si` — re-import edited textures |
 | [ui/list.md](ui/list.md) | `xi ui tex list` — list UI DATs by magic |
@@ -323,8 +333,9 @@ Core lookup tables and named-DAT catalog.
 | [reference/named-dats.md](reference/named-dats.md) | fileId catalog: string tables, system messages, per-zone event/entity ranges |
 | [reference/dat_sections.md](reference/dat_sections.md) | DAT section type reference |
 | [reference/ps2_decomp_crosscheck.md](reference/ps2_decomp_crosscheck.md) | 2003 PS2 client decompile vs. these docs: verified formulas, SE names for event/scheduler opcodes, 2003 packet opcode tables, section-type map |
+| [reference/ps2_beta_2001.md](reference/ps2_beta_2001.md) | 2001 PS2 beta disc (unstripped ELF): SE `RES_TYPE` names for every section code, SE names for all `0x05` generator and `0x07` scheduler opcodes, attach points, hide groups, POL library names and ciphers |
 | [ffximain/dll.md](ffximain/dll.md) | `xi dll` category: shared POL1 unpack/pack for FFXiMain / polcore / app |
-| [ffximain/ffximain.md](ffximain/ffximain.md) | FFXiMain.dll: POL1 algorithm, gear groups, model formulas, Ghidra |
+| [ffximain/ffximain.md](ffximain/ffximain.md) | FFXiMain.dll: POL1 algorithm, gear groups, model and sub-area file-id formulas, Ghidra |
 | [ffximain/polcore.md](ffximain/polcore.md) | polcore.dll: PlayOnline COM host, IPOLCoreCom, base collision with FFXiMain |
 | [ffximain/app.md](ffximain/app.md) | app.dll: PlayOnline Viewer UI / apps module |
 | [ffximain/inventory.md](ffximain/inventory.md) | FFXiMain.dll 80→120 inventory expansion: relocation root cause, object-relative patching, what's left |
@@ -361,3 +372,9 @@ Reference material from other researchers.
 |------|---------|
 | [external_source/zone184_event22.md](external_source/zone184_event22.md) | Annotated event bytecode dump — zone 184, event 22 |
 | [external_source/New-Player-Cutscene-Pipeline.md](external_source/New-Player-Cutscene-Pipeline.md) | New-player cutscene pipeline notes |
+
+### PS2 PlayOnline Viewer
+
+| Doc | Summary |
+|-----|---------|
+| [ps2_pol_viewer_2001.md](reference/ps2_pol_viewer_2001.md) | SLPM 621.34 POL Viewer disc (`F:\`): CDFILE map, MWo3 `.pex`, POLKEY / `.pex.enc` open leads |

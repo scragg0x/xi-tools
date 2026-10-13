@@ -72,6 +72,7 @@ from xi.fx       import xi_export       as fx_export
 from xi.tex      import xi_list       as tex_list
 from xi.tex      import xi_export      as tex_export
 from xi.tex      import xi_import     as tex_import
+from xi.tex      import xi_normals    as tex_normals
 from xi.title    import xi_title_cmds as title_cmds
 from xi.ui       import xi_extract   as ui_export
 from xi.ui       import xi_gen_sheet as ui_gen_sheet
@@ -190,8 +191,11 @@ def ftable():
 @click.option('--pivot/--no-pivot', default=True, show_default=True,
               help='Also grow the pivot/override pack tables (FFXI_PIVOT_DIR) to the same size — the '
                    'client merges them with the base install, so a size mismatch crashes it.')
+@click.option('--no-dll', is_flag=True,
+              help="Don't patch FFXiMain.dll's gear groups (for a client that patches them at load, "
+                   "such as cexidats); the gear windows are expanded and linked all the same.")
 @click.pass_context
-def ftable_expand(ctx, no_gear, no_backup, dry_run, debug, force, pivot):
+def ftable_expand(ctx, no_gear, no_backup, dry_run, debug, force, pivot, no_dll):
     """Expand FTABLE/VTABLE buffers for custom entity AND gear models.
 
     \b
@@ -203,6 +207,7 @@ def ftable_expand(ctx, no_gear, no_backup, dry_run, debug, force, pivot):
     Examples:
       xi ftable expand              # both, config defaults (entity 30000 + gear 4095)
       xi ftable expand --no-gear    # entity buffer only (skips the gear DLL check)
+      xi ftable expand --no-dll     # both, but leave FFXiMain.dll alone (cexidats patches it)
       xi ftable expand --dry-run -v # preview the unified plan with timings
       xi ftable expand entity 30000 # entity only, explicit modelid ceiling
       xi ftable expand gear 4000    # gear only, explicit per-slot max
@@ -210,7 +215,7 @@ def ftable_expand(ctx, no_gear, no_backup, dry_run, debug, force, pivot):
     if ctx.invoked_subcommand is not None:
         return
     gear_inject.expand_all(do_gear=not no_gear, do_backup=not no_backup,
-                           dry_run=dry_run, debug=debug, force=force, pivot=pivot)
+                           dry_run=dry_run, debug=debug, force=force, pivot=pivot, dll=not no_dll)
 
 ftable_expand.add_command(expand.entity_cmd,            'entity')
 ftable_expand.add_command(gear_inject.gear_expand_cmd,  'gear')
@@ -513,6 +518,7 @@ tex.add_command(tex_list.list_cmd,     'list')
 tex.add_command(xi_simplified.tex_json_cmd, 'json')
 tex.add_command(tex_export.export_cmd, 'export')
 tex.add_command(tex_import.import_cmd, 'import')
+tex.add_command(tex_normals.normals_cmd, 'normals')
 tex_list.list_cmd.hidden = True
 
 
@@ -594,6 +600,27 @@ def server():
 server.add_command(server_cmds.db_cmd,     'db')
 server.add_command(server_cmds.status_cmd, 'status')
 server.add_command(server_cmds.npc_snapshot_cmd, 'npc-snapshot')   # bake the offline npc_list fallback
+
+from xi.server import xi_check as server_check
+from xi.server import xi_ws_widen as server_ws_widen
+
+server.add_command(server_check.check_cmd,        'check')      # read-only setup report (xi.server-check.v1)
+server.add_command(server_ws_widen.ws_widen_cmd,  'ws-widen')   # write the weapon-skill 16-bit C++ patch + SQL
+
+
+# ── database (the client's record tables; their edits are `xi dats` database actions) ──
+
+from xi.database import xi_grow as database_grow
+
+
+@cli.group()
+def database():
+    """The client's record tables: item DATs and d_msg tables. Edits to their records are
+    `xi dats` database actions; this sets a table up (its size) once."""
+    pass
+
+
+database.add_command(database_grow.cmd, "grow")
 
 
 # ── mv (xi-model-viewer list refresh) ─────────────────────────────────────────

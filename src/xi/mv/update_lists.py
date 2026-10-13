@@ -1092,6 +1092,13 @@ def update_gear_sets(
         data["rangedDisplay"] = ranged
         sections_written = True
 
+    # And the engaged-state rule: which action groups play with the weapons
+    # drawn (the client's attack-motion pack and the weapon skills).
+    engaged = doc.get("engagedDisplay")
+    if engaged and data.get("engagedDisplay") != engaged:
+        data["engagedDisplay"] = engaged
+        sections_written = True
+
     # Sets that were tagged once and have since been withdrawn: strip them so a
     # list written by an older run converges instead of keeping a dead bucket.
     retired = set(_gear_sets_doc().get("retiredSets") or [])
@@ -2089,7 +2096,7 @@ def update_abilities(
     produce a placeholder — the names come from the server SQL (`XI_SERVER_DIR`),
     which not every machine has.
     """
-    from xi.ability.xi_catalog import build_catalog
+    from xi.ability.xi_catalog import build_base_motions, build_catalog
     from xi.entity.anim.xi_motion_tables import RACE_NAMES
 
     out = lists_dir / ABILITIES_LIST
@@ -2112,7 +2119,8 @@ def update_abilities(
             kept += 1
     added = [e["spec"] for e in entries if e["spec"] not in prev_entries]
     removed = sorted(set(prev_entries) - {e["spec"] for e in entries})
-    data = {"races": list(RACE_NAMES), "entries": entries}
+    base_motions = build_base_motions(echo=notify)
+    data = {"races": list(RACE_NAMES), "entries": entries, "base_motions": base_motions}
     changed = not prev_entries or bool(added) or bool(removed) or (
         prev_path == out and _load_json(out) != data)
     if changed:

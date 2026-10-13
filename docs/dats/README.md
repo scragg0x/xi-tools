@@ -28,17 +28,18 @@ When you **already have the built `.DAT` files** and just want to place them at 
 model ids — no `mesh export` / GLB rebuild — run the wizard:
 
 ```bash
-uv run xi dats new
+uv run xi dats new            # builds into the base install (FFXI_DIR)
+uv run xi dats new --pivot    # builds into FFXI_PIVOT_DIR instead
 ```
 
 It walks you through, in order:
 
-1. **Target check.** Reports each live target (`FFXI_DIR`, and `FFXI_PIVOT_DIR` if
-   distinct) and whether its `FTABLE` is **expanded** for each content type (with sizes),
-   warning about any that aren't:
+1. **Target check.** Reports the build target — the base install (`FFXI_DIR`), or
+   `FFXI_PIVOT_DIR` with `--pivot` — and whether its `FTABLE` is **expanded** for each
+   content type (with sizes), warning about any that aren't:
 
    ```text
-   Pivot overlay (FFXI_PIVOT_DIR): …\DATs\<your-overlay>
+   Pivot folder (FFXI_PIVOT_DIR): …\DATs\<your-overlay>
      FTABLE: 423,152 entries
        ✓ Mounts: file_ids up to 102,768
        ✓ Entity models: custom band from file_id 113,239
@@ -54,8 +55,9 @@ It walks you through, in order:
    tweaks it, and gear re-uses each slot's destination block (overwrite in place).
 
 3. **Content type** — `Gear`, `Mounts`, `Entity (NPC / Monster / Object)`,
-   `NPC (costume: race + gear + weapons)`, or `Ability` (a recipe from the model
-   viewer's Ability Mixer or `xi ability recipe`).
+   `NPC (costume: race + gear + weapons)`, `Ability` (a recipe from the model
+   viewer's Ability Mixer or `xi ability recipe`), or a `Spell` / `Command` menu
+   record (a new spell or job-ability id with its name, help and stats).
 
 4. **Type-specific questions** (see below), then it writes the manifest action and offers
    to build (with a dry-run preview first).
@@ -130,40 +132,274 @@ See [../entity/npc-look.md](../entity/npc-look.md).
 
 ### Ability (a composed job ability / spell / weapon skill)
 
-Point it at a **recipe** (`*.recipe.json`, [schema](../../schema/ability_recipe.json))
-— the wizard lists the ones under `exports/ability/` — then choose what to publish it
+Point it at a **mix file** (`*.mix.json`, formerly `*.recipe.json` — both are read;
+[schema](../../schema/ability_recipe.json)) — the wizard lists the ones under
+`exports/ability/` — then choose what to publish it
 as (auto reads it off the recipe: a `ws:` motion lane is a weapon skill, a `spell:` one
 a spell, else a job ability), the animation number (auto = the next free one) and the
-ROM10 folder. The recipe is copied to `projects/resources/ability/` and the build
-composes it, places the DAT(s) and registers the file id(s); the number it took is
-recorded on the action and the server SQL lands in `projects/server/abilities/`. The
+ROM10 folder. The mix is copied to `projects/resources/ability/<slug>.mix.json` (a texture
+it gives as a PNG file is inlined, so the copy stands alone; an older manifest's
+`<slug>.recipe.json` still builds) and the build composes it, places the DAT(s) and
+registers the file id(s); the number it took is recorded on the action. The action id
+comes from the recipe's `name`, not the file name. Each publish also fills its own
+folder, `projects/abilities/<slug>/` (`<slug>` is the action id's last part): the server
+SQL, a copy of every DAT it placed at its ROM path, and `placements.json`
+([schema](../../schema/ability_publish.json)) naming the file id of each, so the ability
+can be handed on or packaged as one folder. The folder holds only the latest publish;
+files you add to it — the model viewer's mix files among them — are kept. The
 same action from arguments, with every parameter defaulted:
 
 ```bash
-uv run xi dats prepare exports/ability/mixer/tiger_fury.recipe.json --project tiger_fury --replace
+uv run xi dats prepare exports/ability/mixer/tiger_fury.mix.json --project tiger_fury --replace
 uv run xi dats build tiger_fury --dry-run
 ```
 
+`dats build` can also update the local server's row for it, place the client menu record
+at the same id and write its Lua script — see
+[ability server options](#ability-server-options---apply-db---menu-record---lua-stub).
+
 Full detail: [../ability/mixer.md](../ability/mixer.md#publish).
+
+### Spell / command menu record (a new spell or job-ability id)
+
+Point it at a **definition** (`*.spell.json` / `*.command.json`,
+[schema](../../schema/spell_definition.json), [schema](../../schema/command_definition.json)):
+the retail record to clone (`copy_from`), the names and help, and the fields that differ
+(MP, cast/recast, element, learnable jobs and levels; level, TP, targets for commands).
+Then choose the id — auto takes the highest free one above the retail band (spells
+1024–4095, commands 2816–4095), top-down so retail can never reach it. The build grows
+the `mgc_` / `comm` section of `ROM/118/114.DAT`, writes the record and the EN/JP
+name/help blocks, records the id (and a spell's menu index) on the action and emits a
+server row template to `projects/server/spells/` or `commands/`. A client without a
+ceiling plugin such as cexislots ignores the new band, and `prepare`, the wizard and the
+build say so with a ⚠ — see [../menu/records.md](../menu/records.md). Names hold 39
+bytes (commands) or 99 (spells) and help 215; a longer text is refused before anything
+is written. From arguments, with every parameter defaulted (the type is inferred from
+the definition's `schema`):
+
+```bash
+uv run xi dats prepare exports/menu/testspell.spell.json --project testspell --replace
+uv run xi dats build testspell --dry-run
+uv run xi dats build testspell --pivot     # into FFXI_PIVOT_DIR's 114.DAT + name tables
+```
+
+Full detail: [../menu/records.md](../menu/records.md).
+
+### Database records (edit or add items, key items, titles, …)
+
+Pick a table (Armor, Weapons, Key items, …), give a record id, see what it holds now, then
+type the changes one per line — `level=50`, `jobs=WAR,PLD`, `description~HP+15=>HP+30`,
+`mod.HP=30` for the proposed SQL. An empty item slot asks which record to copy into it
+(`copy_from`). The edits go into `database.<project>`, merged by table and id with what an
+earlier run wrote. Non-interactive: `xi dats prepare edits.json --project P [--merge]` with
+a list of edits. See [../database/README.md](../database/README.md).
+
+### Zone dialog (edit or add the lines a zone's NPCs say)
+
+Give the zone, then a line id (or `new` for one at the end), see its English and Japanese
+text, and type the new text — `old=>new` changes part of it. The lines go into
+`zone_dialog.<project>`. Non-interactive: `xi dats prepare lines.json --project P` with
+`{"zone": 245, "lines": [...]}`. See [../dialog/zone_dialog.md](../dialog/zone_dialog.md).
+
+Naming: `database` is the client's global tables; what belongs to one zone's DATs is
+`zone_*` (`zone_dialog`, `zone_npcs`, `zone_events`); `ui` is the visual interface only —
+textures and layout, never text.
+
+### Zone NPCs (rename or add a zone's NPCs)
+
+Give the zone, then an NPC id to rename or `new` to add one: its name, model id and status
+(6 = shown only by an event, the default; 0 = stands in the zone, with a position). A new NPC
+takes the next free id in the custom band (0x380+). The NPCs go into `zone_npcs.<project>`,
+their `npc_list` rows into `<project>.sql`. See [../zone/zone_npcs.md](../zone/zone_npcs.md).
+
+### Zone events (cutscenes and dialogue on a zone's NPCs)
+
+Give the zone, then a cutscene file (from the zone editor or `xi event decompile`) with its
+camera placement when it has a camera, or a dialogue: the NPC's entity id and its lines. The
+events go into `zone_events.<project>`, their start scripts into `<project>.lua`.
+Non-interactive: `xi dats prepare cutscene.json --project P [--zone N] [--camera ROM10/…]`,
+or `xi event cutscene compile` / `xi event dialogue new`, which prepare and build in one go.
+See [../events/zone_events.md](../events/zone_events.md).
+
+### Copy a file as it is (a redrawn UI sheet, a music track …)
+
+For content kept as the finished file, not as edits: a UI sheet redrawn with `xi ui tex
+import`, a replaced `.bgw` track. Pick the file, then where in the game folder it goes
+(guessed from its own path when that ends in `ROM…/n/n.DAT` or `sound…/…`). The action is
+`copy.<project>`; the file is referenced where it is (relative to the project file), not
+copied into resources. Non-interactive: `xi dats prepare rom/ROM/119/51.DAT --project P
+--type copy [--target ROM/119/51.DAT]`. Nothing is registered unless a file id is given
+(the wizard asks for a ROM DAT path; `--file-id N`): then N is registered at that path, for a
+new DAT the client doesn't read yet, such as a retail effect cloned to a custom animation
+number (`--target ROM10/20/0.DAT --file-id 424764`).
 
 ## Building (`xi dats build`)
 
 A build writes DATs and patches their file_ids **directly into the base install
-(`FFXI_DIR`)**. There is no multi-target `--target pivot,hd` switch — the base install is
-the only place custom gear/entity file_ids can register (XIPivot cannot overlay the root
-`FTABLE`). After a successful pack build, if `FFXI_PIVOT_DIR` is set, the custom region of
-the pivot's tables is updated via `sync_pivot_from_base()` so sizes stay uniform and the
-new file_ids resolve through the overlay.
+(`FFXI_DIR`)** — or, with **`--pivot`**, into `FFXI_PIVOT_DIR` instead. A configured
+`FFXI_PIVOT_DIR` is never written to without the flag (apart from the table sync below).
+After a successful pack build into the base install, if `FFXI_PIVOT_DIR` is set, the
+custom region of the pivot's tables is updated via `sync_pivot_from_base()` so sizes stay
+uniform and new gear/entity file_ids resolve through it; a `--pivot` build registers in
+the pivot's own tables and skips that sync. Each action records the target it was built
+into (`result.targets`), and `undo`, `package` and `release` follow it.
 
 ```bash
 uv run xi dats build --project gyokko_mask            # into FFXI_DIR, then sync pivot tables
+uv run xi dats build --project gyokko_mask --pivot    # into FFXI_PIVOT_DIR (no sync)
 uv run xi dats build --project gyokko_mask --dry-run  # preview only, writes nothing
 uv run xi dats changelog --project gyokko_mask        # table of recorded results
 ```
 
-- The base install's `FTABLE`/`VTABLE` **must already exist and be expanded** for the custom
+### Applying, `--reset` and `--list`
+
+The types that edit tables in place (`database`, `zone_dialog`, `zone_npcs`, `zone_events`)
+record what each build changed. A build assumes the tables are ready and applies to them as
+they are; resetting is asked for with `--reset`.
+
+| Build | What it does |
+|---|---|
+| `xi dats build P` | **Applies** the edits to the tables as they are. What an edit names is written, replacing whatever is there (a record, line or NPC another build or retail put at that id included); an edit already there writes nothing. A `zone_events` action replaces its own events from its last build. An edit taken out of the project stays in the tables. The build's records are kept after the last build's, so `undo` takes both back. |
+| `xi dats build P --reset` | First **resets** every table the actions being built edit in place to the install's untouched copy (its `.base`), then applies. With `--only`, any other action of the project that edited one of those tables is built again too (a reset table loses all of its edits). The zone editor's Publish / Delete builds this way; `xi event cutscene compile` and `xi event dialogue new` take `--reset` too. |
+| `xi dats build --list` | Builds every project of a **build list** in its order, each on top of the ones before it. |
+| `xi dats build --list --reset` | Resets every table any of the list's projects edits once, then builds them in order: the clean, repeatable build, where projects that share a table layer the same way every time and nothing a project dropped lingers. |
+
+A reset table loses everything written to it since the install's untouched copy, whichever
+project or command wrote it: resetting one project's tables takes away another project's edits of the
+same tables until that project is built again. `--list --reset` is the way to rebuild them all
+together.
+
+The build list is `projects/build_list.json` ([`schema/build_list.json`](../../schema/build_list.json));
+`xi dats build NAME --list` builds `projects/NAME.json`, and a path works too. A list file
+says what it is (its `schema`), so `xi dats build content/release_list.json` builds it as a list
+without `--list`:
+
+```json
+{
+  "schema": "xi.dats.build_list.v1",
+  "projects": ["tweaks", "abyssea", "../editor/lower-jeuno/dats.json"]
+}
+```
+
+A bare name is `projects/<name>.json`; anything else is a path relative to the list file (a
+zone editor project's `dats.json`). A list build reads and checks every project first and
+builds nothing if one is missing or has an invalid action; `--only` doesn't go with it.
+
+What `--reset` resets: the tables the actions' recorded results name — the database, dialog,
+NPC-name and event tables, and `114.DAT` with its name tables for spell / command records — and
+the tables a `database` or `zone_dialog` action's edits name, so a project that was
+never built into the target (a fresh clone) resets them too. For `--list` also the tables the
+list file's `result` recorded, so a table a project no longer
+edits, or a project taken off the list, goes back too. DATs an action places (gear, abilities,
+camera scenes) aren't reset: a build replaces them. An ability's menu record isn't either,
+but when `114.DAT` is reset it goes with it; the build says so, and `--menu-record` places it
+again.
+
+What a table resets to is always the install's (`FFXI_DIR`) untouched copy — its `.base`, the
+one every in-place edit keeps, else the file itself — and never the pivot folder's:
+
+| Build | Reads and writes | `--reset` |
+|---|---|---|
+| `xi dats build P` | the install's DATs, in place | each table back to its `.base` in the install |
+| `xi dats build P --pivot` | the pivot folder's copy; a table it doesn't have is read from the install and written into the folder | the install's `.base` (else its file) copied over the pivot folder's copy |
+
+A `--pivot` build keeps no `.base` in the pivot folder, and never writes the install. Without
+`--reset` it applies on top of what the folder holds, so a server's DATs folder keeps its other
+edits; with `--reset` the tables it edits start from the install's again.
+
+A table a client plugin reads to a fixed row count is grown once with
+[`xi database grow`](../database/README.md#growing-a-table-xi-database-grow), in the install:
+its `.base` grows with it, so every reset (`--pivot` too) keeps the rows.
+
+```bash
+uv run xi dats build P --reset                   # this project's tables from .base, then build
+uv run xi dats build --list --reset --dry-run    # what would be reset and built
+uv run xi dats build --list --reset              # every project of projects/build_list.json, clean
+uv run xi dats build release --list --pivot      # projects/release.json, on top, into FFXI_PIVOT_DIR
+uv run xi dats build content/release_list.json --reset --pivot   # a list file: the install's tables + its projects
+```
+
+A dry run holds each step's writes (the reset included) in memory, so later steps and later
+projects plan against earlier ones.
+
+### Ability server options (`--apply-db`, `--menu-record`, `--lua-stub`)
+
+For `ability` actions a build can also do the server side, after every DAT is placed and
+recorded (the model viewer's Manage switches *Database Update*, *Client Menu Record* and
+*Lua Stub*; [../ability/mixer.md](../ability/mixer.md#database-update-client-menu-record-lua-stub)
+has the rules):
+
+```bash
+uv run xi dats build love --apply-db --clone-from fire --menu-record --lua-stub [--dry-run]
+```
+
+| Option | What it does |
+|---|---|
+| `--apply-db` | Update the `spell_list` / `abilities` / `weapon_skills` row named after the mix (animation only), or, when there is none, insert one cloned from the kind's default donor (`cure` / `berserk` / `fast_blade`). With `--dry-run`: SELECTs only. |
+| `--db-row ID` | Confirm, once, a row this mix did not create (the build says `needs-confirm` and names it). |
+| `--clone-from X` | Override the donor a new row, menu record and stub clone (an id or a server name). Default: the kind's donor above. |
+| `--server-id ID` | The id for a new row / menu record (default: the highest one blank in the client and free on the server). |
+| `--menu-record` | The client `mgc_` / `comm` record (and its names) at the row's id, over a blank retail placeholder only — never a named row, whatever `--force` says. |
+| `--menu-name TEXT` | What the menu shows (default: the mix name, `_` as a space). |
+| `--lua-stub` | `<XI_SERVER_DIR>/scripts/actions/…/<name>.lua` for a row this mix created. |
+
+Credentials come from xi-tools' `.env` (`XI_DB_*`), never from the command line. Each
+step prints one line (`db: …`, `menu: …`, `lua: …`, then `⚠` warnings) and never fails the
+build: the exit code is 0 whenever the DATs were placed. What each step did is recorded
+on the action (`result.db`, `result.menu`, `result.lua`) and carried over by every later
+build. A real build that wrote a row ends with `database: 1 row written (spell_list
+#1023) — restart the map server (xi_map) to load it`, and the publish folder gains
+`<slug>_<animation>.applied.sql`, the statements that ran.
+
+### Which table registers a file_id
+
+The client resolves a file_id through the `ROM{n}` pair first (`ROM10/FTABLE10.DAT` +
+`VTABLE10.DAT`) and falls back to the main `FTABLE.DAT`/`VTABLE.DAT`. XIPivot swaps in
+the pivot folder's copy of a `ROM{n}` pair, but the main pair always comes from the base
+install: the pivot folder's copy of it is never read. Tested in game with `!injectaction`
+(a job ability, a spell and a weapon skill each played its custom DAT when registered only
+in the pivot folder's `ROM10` pair, even over a main entry still pointing at a retail
+placeholder), and XIPivot's debug log shows the same — it serves `ROM10/FTABLE10.DAT` from
+the pivot folder and never sees `FTABLE.DAT` opened.
+
+So a build registers a `ROM{n}` placement in the target's `ROM{n}` pair. In the base
+install the main pair gets the same entry when it is big enough to hold the id (for the
+tools that read only that pair); a retail-sized main `FTABLE` — a launcher may put one
+back — is left alone instead of failing the build. A pivot folder that carries its own main
+pair gets the entry there too: the client never reads it from the pivot folder, so that pair
+is the base game's, kept with the pivot folder to ship to the install (CatsEyeXI's dats keeps
+it in `rom/`, started from the retail client's each build). A `ROM/…` placement registers in
+the main pair, so it needs the base install: with `--pivot` the build refuses one that would
+need a new entry.
+
+What this means with a pivot folder that carries its own `ROM10` tables (CatsEyeXI's does):
+
+- A job ability, spell or weapon skill built into the base install lands in the install's
+  `ROM10` tables, which that client never reads, and `sync_pivot_from_base()` copies only
+  the custom region above retail (109,701 on), so it stays invisible there. Build those
+  with `--pivot` (the model viewer's *Use Pivot Folder*).
+- The same resolution order decides whether a slot is free: builds and the ability
+  publisher read the `ROM{n}` pair first, so a slot that is live through a `ROM{n}` entry
+  is never handed out again.
+- Gear and entity ids sit in the custom region, so a base-install build reaches the pivot
+  folder through the sync — and the same sync overwrites that region of the pivot folder's
+  tables, including entries a `--pivot` build registered there. Don't mix plain and
+  `--pivot` builds for gear and entities.
+
+- The target's `FTABLE`/`VTABLE` **must already exist and be expanded** for the custom
   models you're placing — run `xi ftable expand entity` / `xi ftable expand gear` on
   that install first. The wizard's opening step reports expansion status.
+- A `ROM{n}` pair long enough to hold the id is **not** on its own enough: the client
+  takes its file_id ceiling from the tables it loads at startup, and those come from the
+  **base install**. A `--pivot` build registers, it does not expand.
+
+  Measured against an install still at the retail 109,701 entries, with the pivot
+  folder's `ROM10` pair grown to 431,344: a `ROM10` registration at file id 100,500
+  loaded in game, the same registration at 109,750 did not, and lengthening only the
+  pivot pair changed neither. After `xi ftable expand` grew the install's tables, both
+  loaded. So expansion is a one-time write to the install (or a table set a launcher
+  ships) before any file_id past the retail range exists at all — and it is the first
+  thing to check when a registration that reads back correctly resolves to nothing.
 - Each table is backed up once to `<name>.base` before the first patch (recoverable via
   `xi ftable reset`).
 - **`--dry-run`** prints the full per-DAT placement plan (every race for gear) and any
@@ -178,16 +414,18 @@ project's DATs from the live install frees those slots again.
 ## Packaging for distribution (`xi dats package`)
 
 ```bash
-uv run xi dats package gyokko_mask               # read from FFXI_DIR (default --from dir)
-uv run xi dats package gyokko_mask --from pivot  # or pivot | hd
+uv run xi dats package gyokko_mask               # read from where it was built
+uv run xi dats package gyokko_mask --from pivot  # or dir | pivot | hd
 ```
 
 With no project argument, lists `projects/*.json` to pick from. Reads from **one** source
-(`--from dir|pivot|hd`, default `dir` — where builds land). Zips everything needed to run
-one project as an overlay:
+(`--from dir|pivot|hd`; the default is where the project was built — `pivot` when every
+build used `--pivot`, else `dir`). Zips everything needed to run one project as an overlay:
 
-- every DAT the project's actions placed (from each action's inline `result` — all
-  per-race DATs for gear), plus the mount name/help/key-item string DATs for mount actions,
+- every DAT the actions built into that source placed (from each action's inline `result`
+  — all per-race DATs for gear), plus the mount name/help/key-item string DATs for mount actions,
+- for an ability whose client menu record was placed in that source (`--menu-record`):
+  `ROM/118/114.DAT` and the name/help tables it edited, so players get its menu entry,
 - the full `FTABLE`/`VTABLE` set (so the new file_ids resolve).
 
 Files are laid out ROM-relative inside the zip (XIPivot-ready). Build the project first.
@@ -198,7 +436,7 @@ Two different trees — don't confuse them:
 
 | Path | Role |
 |---|---|
-| **Live target** (`FFXI_DIR`) | Where `dats build` places mesh/entity/gear/mount DATs + table patches. Then `sync_pivot_from_base()` updates pivot overlay tables when configured. |
+| **Live target** (`FFXI_DIR`, or `FFXI_PIVOT_DIR` with `--pivot`) | Where `dats build` places mesh/entity/gear/mount DATs + table patches and edits menu records. After a base-install build, `sync_pivot_from_base()` updates pivot overlay tables when configured. |
 | `projects/resources/` | Source tree you commit: GLBs, PNGs, `zone-changes.json`, imported JSON, mount DATs, etc. |
 | `projects/ffxi/` + `projects/ffxi-hd/` | **Zone actions only** — standard/HD package output trees (not the live gear/entity target). |
 | `projects/packages/` | Zip output from `xi dats package`. |
@@ -211,7 +449,9 @@ dats/
   ffxi/                       # zone standard package tree
   ffxi-hd/                    # zone HD package tree
   packages/                   # distributable zips
-  server/                     # emitted server snippets (e.g. mounts)
+  abilities/<slug>/           # one per ability: its SQL, a copy of each DAT placed, placements.json,
+                              #   <slug>_<n>.applied.sql (--apply-db) and the viewer's <Name>.mix.json
+  server/                     # emitted server snippets (e.g. mounts, spell / command records)
 ```
 
 - **Results are recorded inline** on each action (`action["result"]` = model_id → file_id → DAT,
@@ -279,22 +519,63 @@ Minimal mesh action source for `xi dats prepare workspaces/crab/mesh.json`:
 For full action JSON, `prepare` preserves the action fields and copies referenced
 resource files that live next to the source JSON into `projects/resources/<type>/<id>/`.
 
+### Includes
+
+An `actions` entry can be a string: the path, relative to the file it appears in, of an
+include file ([`schema/include.json`](../../schema/include.json)) whose actions are spliced
+in at that spot. One feature can then keep one project file and split its actions across
+files — gear, record edits, events — without splitting the build:
+
+```json
+{
+  "schema": "xi.dats.v1",
+  "name": "abyssea",
+  "roots": {"standard": "projects/ffxi", "hd": "projects/ffxi-hd", "resources": "projects/resources"},
+  "actions": [
+    "abyssea/gear.json",
+    "abyssea/records.json",
+    {"id": "ability.tomahawk", "type": "ability", "kind": "auto", "…": "…"}
+  ]
+}
+```
+
+```json
+{
+  "schema": "xi.dats.include.v1",
+  "description": "Abyssea: the record edits",
+  "actions": [{"id": "db.abyssea", "type": "database", "edits": ["…"]}]
+}
+```
+
+- Every command reads the project flattened: one action list, in order, includes nested
+  as deep as they go. `xi dats json` prints it that way.
+- A write puts each action back in the file it came from: a build's `result` lands in the
+  include file beside its action, and the include strings stay where they were written.
+  An include file whose actions didn't change is left alone. An action added by `new` or
+  `prepare` goes in the project file.
+- Included actions need an `id` (it is how they are matched back), and an id may appear
+  once across the project and its includes. A missing file, a file without
+  `"schema": "xi.dats.include.v1"` and an include cycle are refused, naming the file.
+- Keep include files in a folder under `projects/` (`projects/abyssea/records.json`):
+  project lists and cross-project scans read only `projects/*.json`, and skip an include
+  file found there.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `xi dats new` | **Interactive wizard** — place prebuilt DATs (gear/mount/entity/NPC) at new model ids, or publish an ability recipe, and write a manifest action |
-| `xi dats build [manifest]` | Build into the **base install** (`FFXI_DIR`), then `sync_pivot_from_base()` when a pivot is configured; `--dry-run` previews (no separate `plan` command) |
-| `xi dats package <project>` | Zip the project's built DATs + F/V tables (`--from dir`/`pivot`/`hd`, default `dir`) into `projects/packages/<project>.zip` (ROM-relative, XIPivot-ready) |
-| `xi dats release <project>` | Stage the project's DATs + full FTABLE/VTABLE set + patched `FFXiMain.dll` into `<release>\Game\FINAL FANTASY XI\…` (a launcher build folder). Prompts for the folder; `--to <path>`, `--no-dll` |
-| `xi dats undo <project>` | Reverse a build: delete the placed DATs + clear their file_id entries, then remove the manifest (`--keep-json` keeps it) |
+| `xi dats new` | **Interactive wizard** — place prebuilt DATs (gear/mount/entity/NPC) at new model ids, publish an ability recipe, or add a spell / command menu record, and write a manifest action; `--pivot` checks and builds into `FFXI_PIVOT_DIR` |
+| `xi dats build [manifest]` | Build into the **base install** (`FFXI_DIR`), then `sync_pivot_from_base()` when a pivot is configured; `--pivot` builds into `FFXI_PIVOT_DIR` instead (no sync); `--dry-run` previews (no separate `plan` command); `--reset` resets the tables the build edits from `.base` first; `--list` builds the projects of a build list in order ([above](#applying---reset-and---list)); for abilities `--apply-db` / `--menu-record` / `--lua-stub` ([above](#ability-server-options---apply-db---menu-record---lua-stub)) |
+| `xi dats package <project>` | Zip the project's built DATs + F/V tables (`--from dir`/`pivot`/`hd`, default where it was built) into `projects/packages/<project>.zip` (ROM-relative, XIPivot-ready) |
+| `xi dats release <project>` | Stage the project's DATs + full FTABLE/VTABLE set + patched `FFXiMain.dll` into `<release>\Game\FINAL FANTASY XI\…` (a launcher build folder), and the DATs of `--pivot` builds into the release's pivot folder. Prompts for the folder; `--to <path>`, `--no-dll` |
+| `xi dats undo <project>` | Reverse a build in each target an action was built into: delete the placed DATs + clear their file_id entries, put menu records back (an ability's only while the row still holds what the build wrote), then remove the manifest (`--keep-json` keeps it). `--apply-db` also reverts the database row an ability inserted or changed and deletes its unedited Lua stub; without it they are listed (with the revert SQL) and left, and the manifest is **kept** — its cleared actions marked `undone` — until a later `undo --apply-db` removes them (a row already gone or already back at its old animation counts as done). An ability menu record that can't be written back (the game has `114.DAT` open) also keeps the manifest, and the next undo retries it |
 | `xi dats json [manifest]` | Print the normalized manifest JSON |
-| `xi dats prepare <source> [manifest]` | Copy an exported JSON/change-set/ability recipe into `projects/resources` and add an action (`--type`, and for abilities `--kind` / `--animation` / `--subdir`) |
+| `xi dats prepare <source> [manifest]` | Copy an exported JSON/change-set/ability recipe/spell or command definition into `projects/resources` and add an action (`--type`; for abilities `--kind` / `--animation` / `--subdir`; for spells and commands `--record-id` / `--menu-index`); `--type copy` takes any file, referenced where it is, with `--target` its game path |
 | `xi dats changelog [manifest]` | Table of each action's recorded inline `result` (model_id → file_id → DAT) |
 
 > Note: `new`/`build` write mesh/entity/gear/mount DATs + table patches into **`FFXI_DIR`**
-> (then sync pivot tables), while `zone` actions still build the `projects/ffxi` +
-> `projects/ffxi-hd` package trees.
+> (then sync pivot tables), or into `FFXI_PIVOT_DIR` with `--pivot`, while `zone` actions
+> still build the `projects/ffxi` + `projects/ffxi-hd` package trees.
 
 ## Current builders
 
@@ -310,8 +591,63 @@ Verbatim-placement types (written by `xi dats new`, built into the live target):
 - `ability`: composes a recipe (`xi.ability.xi_compose`) into one DAT (job ability /
   spell) or body + two companion DATs per race (weapon skill), takes the animation
   number against the live tables, places them under `ROM10/<subdir>/` and registers the
-  file ids; records kind / animation / placements on the action and emits the server
-  SQL to `projects/server/abilities/`. Needs no table expansion.
+  file ids; records kind / animation / placements on the action and writes the publish
+  folder `projects/abilities/<slug>/`: the server SQL, a copy of each placed DAT
+  at its ROM path and `placements.json` (`schema/ability_publish.json`), replacing what
+  the previous publish of the action put there. Needs no table expansion. With
+  `--apply-db` / `--menu-record` / `--lua-stub` it then updates the server row, places
+  the client menu record and writes the Lua stub, recording `result.db` / `menu` / `lua`.
+- `spell` / `command`: writes a definition (`xi.menu.xi_menu_table`) as a new record of
+  `ROM/118/114.DAT` (the `mgc_` / `comm` section grown to hold it) plus its EN/JP
+  name/help blocks in `ROM/181`, at an id above the retail band decided against the
+  live table; records `record_id` (+ `menu_index`) and the edited string tables on the
+  action, emits a server row template to `projects/server/spells|commands/`. No file
+  ids, no table expansion; the client needs a ceiling plugin such as cexislots to show
+  the band. A `--force` overwrite keeps the old row on `result.replaced` for `undo`.
+- `copy` ([`schema/copy.json`](../../schema/copy.json), `xi.dats.xi_copy`): writes
+  `resources.file` as it is at `target.path` (any path in the game folder, `ROM/119/51.DAT`
+  or `sound9/win/music/data/music067.bgw`), matching the case of a file already there. With
+  `target.file_id` (a ROM DAT path only) it registers that id at the path in the target's
+  tables, as a mount's model is, and `undo` clears it; without it no tables are touched.
+  In the install the file it replaces is kept as `<file>.base` and
+  `undo` puts it back (a file that was new is deleted); in a pivot folder `undo` deletes the
+  copy. A build into the folder the source lives in leaves it (`the source itself`), and
+  `undo` never deletes the source.
+
+Record edits:
+
+- `database` ([`schema/database.json`](../../schema/database.json),
+  [../database/README.md](../database/README.md)): edits to the client's record tables —
+  the tables the model viewer's Database shows (items by category, key items, titles, quest
+  and mission logs, spell and ability text) — by table key and id, with the viewer's field
+  and sub-string names. Only the named fields change, in the English and Japanese records,
+  in legacy or retail DATs; `copy_from` copies another record into the slot first, replacing
+  what it holds. Records each changed field's value before and after per target, so `undo`
+  puts the records back. An item edit may carry its server rows (`item_basic`,
+  `item_equipment` with `MId` or a gear action's model, `item_mods`, …), written as proposed
+  SQL to `<project>.sql`, never run. No file ids, no table expansion. A text row past the
+  end is added with `copy_from` (the rows in between are blank). The spell and ability records of
+  `ROM/118/114.DAT` (`spellData`, `abilityData`: MP, cast, recast, job levels, TP, range …)
+  edit the same way, a spell's `spell_list` row going to the SQL; `hex` writes a whole record
+  exactly, and any other table may be named by its ROM path (an item table with its `layout`).
+- `zone_dialog` ([`schema/zone_dialog.json`](../../schema/zone_dialog.json),
+  [../dialog/zone_dialog.md](../dialog/zone_dialog.md)): a zone's dialog lines, edited or
+  added by line id in its English and Japanese tables (`new` lines grow both). Records each
+  line's bytes before and after per target, so `undo` is exact.
+- `zone_npcs` ([`schema/zone_npcs.json`](../../schema/zone_npcs.json),
+  [../zone/zone_npcs.md](../zone/zone_npcs.md)): a zone's NPC names renamed or added (ids from
+  the custom band 0x380+, `auto` allocates past the name and event tables), with the new or
+  changed `npc_list` rows as proposed SQL in `<project>.sql`. Renames set `polutils_name`,
+  never `name` (it binds the NPC's Lua). Recorded per target; `undo` is exact.
+- `zone_events` ([`schema/zone_events.json`](../../schema/zone_events.json),
+  [../events/zone_events.md](../events/zone_events.md)): cutscenes (`xi.cutscene.v1`) and
+  dialogues compiled into a zone's event table, with their lines in its English and Japanese
+  dialog tables, lint-checked before anything is written. Records each changed block as the
+  splice that puts it back and each line's bytes, per target; an `auto` event keeps its id,
+  and a build replaces the action's own events.
+  A camera gets its own scene DAT, placed and registered at a safe-band file id. The
+  cast-name SQL goes to `<project>.sql`, the start scripts to `<project>.lua`, never run.
+  `xi event cutscene compile` and `xi event dialogue new` are aliases of prepare + build.
 
 GLB-rebuild / package types:
 

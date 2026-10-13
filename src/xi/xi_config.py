@@ -21,6 +21,15 @@ def _candidate_env_files():
     yield Path.cwd() / '.env'
 
 
+# Keys ``.env`` never sets. The custom animation bands must match the client plugin, and
+# a line left in the file outlives a plugin change: FX_JA_BAND_FIRST=500 kept the
+# publisher on the old threshold after cexislots moved it to 1024. See the bands below.
+_NOT_FROM_DOTENV = frozenset((
+    'FX_SPELL_BAND_FIRST', 'FX_SPELL_BAND_BASE', 'FX_JA_BAND_FIRST', 'FX_JA_BAND_BASE',
+    'FX_WS_BAND_FIRST', 'FX_WS_BAND_BASE', 'FX_WS_BAND_SLOTS',
+))
+
+
 def _load_dotenv() -> None:
     """Load ``KEY=value`` pairs from the first ``.env`` found into ``os.environ``.
 
@@ -30,6 +39,7 @@ def _load_dotenv() -> None:
     pattern used throughout this module. Real environment variables already set
     ALWAYS win — we never clobber them — so an exported var (or one the launcher set
     before importing xi) takes precedence over the file. The first existing file wins.
+    Keys in ``_NOT_FROM_DOTENV`` are skipped: only a real environment variable sets them.
     """
     for path in _candidate_env_files():
         try:
@@ -51,7 +61,7 @@ def _load_dotenv() -> None:
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
                 value = value[1:-1]
-            if key and value:
+            if key and value and key not in _NOT_FROM_DOTENV:
                 os.environ.setdefault(key, value)
         return  # first file wins
 
@@ -92,7 +102,6 @@ def apply_env_overrides(values: dict[str, str]) -> None:
     """
     global FFXI_DIR, FFXI_PIVOT_DIR, FFXI_HD_DIR, BLENDER_PATH
     global XI_SERVER_DIR, XI_NAVMESH_DIR
-    global DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
     for key, raw in (values or {}).items():
         key = str(key).strip()
         if not key:
@@ -108,14 +117,7 @@ def apply_env_overrides(values: dict[str, str]) -> None:
     BLENDER_PATH = os.environ.get('BLENDER_PATH', BLENDER_PATH)
     XI_SERVER_DIR = os.environ.get('XI_SERVER_DIR') or None
     XI_NAVMESH_DIR = os.environ.get('XI_NAVMESH_DIR') or None
-    DB_HOST = os.environ.get('XI_DB_HOST', DB_HOST)
-    try:
-        DB_PORT = int(os.environ.get('XI_DB_PORT', str(DB_PORT)))
-    except ValueError:
-        pass
-    DB_USER = os.environ.get('XI_DB_USER', DB_USER)
-    DB_PASSWORD = os.environ.get('XI_DB_PASSWORD', DB_PASSWORD)
-    DB_NAME = os.environ.get('XI_DB_NAME', DB_NAME)
+    _refresh_db_globals()
 
 
 def require_ffxi_dir() -> Path:
@@ -156,6 +158,28 @@ def ensure_base(src) -> bool:
         return False
     shutil.copy2(src, base)
     return True
+
+
+def pristine(src) -> Path | None:
+    """The install's untouched copy of ``src``: its ``<dat>.base`` when an in-place edit kept
+    one, else the file itself; None when the install has neither. What ``xi dats build
+    --reset`` resets a table to, in the install and in the pivot folder alike."""
+    src = Path(src)
+    base = src.with_name(src.name + ".base")
+    if base.is_file() and base.stat().st_size:
+        return base
+    return src if src.is_file() else None
+
+
+def reset_to_base(path) -> str:
+    """Put ``path`` (a DAT in the install) back to its ``.base``: ``'restored'``, or
+    ``'none'`` (no ``.base``: never written through xi-tools)."""
+    path = Path(path)
+    base = path.with_name(path.name + ".base")
+    if not base.is_file() or not base.stat().st_size:
+        return "none"
+    shutil.copy2(base, path)
+    return "restored"
 
 
 def output_path_for(src) -> Path:
@@ -315,25 +339,127 @@ TEXTURE_CLAMP = int(os.environ.get('XI_TEXTURE_CLAMP', '2048'))
 CUSTOM_ROM     = os.environ.get('CUSTOM_FTABLE', 'ROM10')
 CUSTOM_ROM_IDX = int(CUSTOM_ROM[3:])   # 'ROM10' -> 10
 
+# ── Custom animation bands ──────────────────────────────────────────────────
+# The client turns an animation number into a DAT file id with fixed arithmetic
+# per kind, and the file ids that arithmetic reaches run out long before the
+# 12-bit number space does: 92 spell animations are free, 161 job ability, and 8
+# weapon skill (`xi ability publish` reports which). A client-side plugin can
+# patch that arithmetic so numbers at or above a threshold resolve into a
+# reserved region instead, and these say where that region is so the publisher
+# can allocate into it.
+#
+#   file_id = BASE + animation                           spells, job abilities
+#   file_id = WS_BASE + (animation - WS_FIRST) * 24      weapon skills, then
+#             + block * 8 + race                         body / waist A / waist B
+#
+# For spells and job abilities the number is added whole: FIRST decides only
+# whether the custom band applies, and is never subtracted. Each base therefore
+# reserves 4096 file ids, one for every value the 12-bit animation field can
+# hold, and the numbers below FIRST simply address the unused front of the block.
+# Offsetting by FIRST instead allocates below where the client will look.
+#
+# Weapon-skill numbers cost 24 file ids each because the client resolves them
+# through per-race motion banks, and there the threshold *is* subtracted: the
+# reserved count is what bounds that band, not the number space. Grouping those
+# ids by number rather than by race keeps WS_SLOTS out of the arithmetic, so
+# raising it later moves nothing already published.
+#
+# A threshold has to clear every number the client is *sent* in that category,
+# not just the table's last entry. Job abilities are the trap: the abilities
+# table ends at 338, but category 6 is also how a server reaches the warp and
+# teleport effects, at 596..656 (`injectActionPacket(id, 6, 600, ...)`), and
+# those must keep the retail arithmetic. A band at 500 broke every scripted
+# teleport in the field; 1024 clears them and leaves 3,072 custom numbers.
+# Spells are fine at 1612: the core's own spell-category numbers stop at 847.
+#
+# Each takes cexislots' value (cexidats src/cexislots/sites.h), so the publisher
+# assumes a client running that plugin. The numbers a stock client can load are
+# still handed out first; the band is only reached once they are used up, and the
+# build says when a number needs the plugin. These are never read from .env
+# (_NOT_FROM_DOTENV): when the plugin moves a threshold, the value here moves with
+# it. Only a real environment variable changes one — the model viewer sends 0 to
+# switch the bands off for a stock client (Settings › XI Tools › Custom animation
+# bands), and a different plugin can export its own.
+def _band(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+FX_SPELL_BAND_FIRST = _band('FX_SPELL_BAND_FIRST', 1612)
+FX_SPELL_BAND_BASE  = _band('FX_SPELL_BAND_BASE', 423152)
+FX_JA_BAND_FIRST    = _band('FX_JA_BAND_FIRST', 1024)
+FX_JA_BAND_BASE     = _band('FX_JA_BAND_BASE', 427248)
+FX_WS_BAND_FIRST    = _band('FX_WS_BAND_FIRST', 272)
+FX_WS_BAND_BASE     = _band('FX_WS_BAND_BASE', 431344)
+FX_WS_BAND_SLOTS    = _band('FX_WS_BAND_SLOTS', 256)
+
+
+def fx_band_ends() -> list:
+    """``(first file id, one past the last)`` of every custom band that is on."""
+    ends = []
+    for first, base in ((FX_SPELL_BAND_FIRST, FX_SPELL_BAND_BASE), (FX_JA_BAND_FIRST, FX_JA_BAND_BASE)):
+        if first and base:
+            ends.append((base, base + 4096))
+    if FX_WS_BAND_FIRST and FX_WS_BAND_BASE and FX_WS_BAND_SLOTS:
+        ends.append((FX_WS_BAND_BASE, FX_WS_BAND_BASE + 24 * FX_WS_BAND_SLOTS))
+    return ends
+
+
+def fx_band_floor() -> int:
+    """The first file id the custom bands reserve (0 when every band is off). They sit
+    past the end of the expanded tables, so a table longer than this is a DAT overlay's
+    ROM pair carrying band registrations, not a table out of step with its peers."""
+    return min((lo for lo, _hi in fx_band_ends()), default=0)
+
+
+def fx_band_ceiling() -> int:
+    """Table entries a DAT overlay's ROM pair needs to register any band file id —
+    cexislots' FX_CEILING (437,488) with its values. The plugin grows the client's one
+    table to this in memory and merges the overlay's pair into it, so only the overlay
+    grows on disk; the install's tables stay as they are."""
+    return max((hi for _lo, hi in fx_band_ends()), default=0)
+
 # ── Local dev server DB (LandSandBoat — xidb) ───────────────────────────────
 # Used by `xi zone new` to auto-apply the generated zone-migration.sql to the
 # running dev server's database. Defaults match a stock local LSB setup (MariaDB on
-# localhost, db=xidb per the Quick Start Guide). Override per-machine via env, or
-# better, point XI_SERVER_DIR at your checkout and let network.lua decide.
-DB_HOST     = os.environ.get('XI_DB_HOST', '127.0.0.1')
-DB_PORT     = int(os.environ.get('XI_DB_PORT', '3306'))
-DB_USER     = os.environ.get('XI_DB_USER', 'root')
-DB_PASSWORD = os.environ.get('XI_DB_PASSWORD', 'xi')
-DB_NAME     = os.environ.get('XI_DB_NAME', 'xidb')
+# localhost, db=xidb per the Quick Start Guide). Set XI_DB_* in .env (Settings ›
+# Local Server in the model viewer, or the zone editor's setup) — the one place
+# credentials live; the server's network.lua is never read. These are the same keys,
+# blank rule and defaults (an empty password) as xi.server.xi_commands._resolve, so
+# `zone new` and `dats build --apply-db` log in the same way.
+def _db_env(key: str, default: str) -> str:
+    """A non-blank ``XI_DB_*`` value (trimmed), else ``default``."""
+    return (os.environ.get(key) or '').strip() or default
+
+
+def _refresh_db_globals() -> None:
+    global DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+    DB_HOST = _db_env('XI_DB_HOST', '127.0.0.1')
+    try:
+        DB_PORT = int(_db_env('XI_DB_PORT', '3306'))
+    except ValueError:
+        DB_PORT = 3306
+    DB_USER = _db_env('XI_DB_USER', 'root')
+    DB_PASSWORD = _db_env('XI_DB_PASSWORD', '')
+    DB_NAME = _db_env('XI_DB_NAME', 'xidb')
+
+
+_refresh_db_globals()
 # Auto-apply migrations on `zone new`. Default (unset/empty) attempts to apply when
 # the DB is reachable and skips gracefully otherwise; '0'/'false'/'no'/'off' disables.
 DB_AUTOAPPLY = os.environ.get('XI_DB_AUTOAPPLY', '').strip().lower() not in ('0', 'false', 'no', 'off')
 
 
 def db_creds() -> dict:
-    """Keyword args for ``pymysql.connect(**db_creds())`` against the dev server DB."""
-    return dict(host=DB_HOST, port=DB_PORT, user=DB_USER,
-                password=DB_PASSWORD, database=DB_NAME)
+    """Keyword args for ``pymysql.connect(**db_creds())`` against the dev server DB.
+
+    Resolved at call time by :func:`xi.server.xi_commands._resolve`, so this and every
+    other database user (``xi server db``/``check``, ``dats build --apply-db``) get
+    identical credentials: non-blank ``XI_DB_*``, else the defaults."""
+    from xi.server.xi_commands import _resolve
+    host, port, user, password, database = _resolve(None, None, None, None, None)
+    return dict(host=host, port=int(port), user=user, password=password, database=database)
 
 # ── Custom model_id ceilings (the "buffers") ───────────────────────────────
 # These are the high-water marks the expand tools provision empty FTABLE/VTABLE

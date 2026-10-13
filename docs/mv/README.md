@@ -59,7 +59,7 @@ indexes whatever JSON is in the directory, so a list this tool does not generate
 | Target | Source | What it adds |
 |---|---|---|
 | `gear` | FFXiMain race tables → FTABLE | Missing gear model ids per race/slot, plus one `rod: true` Ranged row per fishing rod (see [../anim/fishing.md](../anim/fishing.md)) |
-| `gear-sets` | `src/xi/mv/gear_sets.json` + existing labels | `set` on each gear row (Artifact / Relic / Empyrean / Prime / Aeonic / Mythic / Abjuration / Ebur-Furia-Ebon), `groupLabels` renames on weapon-type groups, the `rangedDisplay` rule, and clears any `retiredSets` |
+| `gear-sets` | `src/xi/mv/gear_sets.json` + existing labels | `set` on each gear row (Artifact / Relic / Empyrean / Prime / Aeonic / Mythic / Abjuration / Ebur-Furia-Ebon), `groupLabels` renames on weapon-type groups, the `rangedDisplay` and `engagedDisplay` rules, and clears any `retiredSets` |
 | `gear-labels` | `(JOB Set)` label suffix | Rewrites `Wizard's Coat (BLM Artifact)` → `BLM - Wizard's Coat` (the set is preserved in `set` first) |
 | `ws-unreleased` | `FFXiMain.dll` extended weapon-skill bank | The 16-slot bank at animations 256-271 as a **WS (Unreleased)** action category — clips the client can play that retail never named (see [../anim/weapon-skills.md](../anim/weapon-skills.md)). `dumm` slots skipped |
 | `music` | `sound*/win/music/data` | Unnamed `music*.bgw` |
@@ -72,7 +72,7 @@ indexes whatever JSON is in the directory, so a list this tool does not generate
 | `effect-npcs` | proxy-mesh size + `0x05` generators drawing `0x1F` meshes | `effect: <layers>` and an `(Effect)` name suffix on models whose visible form is an effect, not a mesh — Home Points, portals, telepoints, elementals (104 rows). See [../entity/npc-look.md](../entity/npc-look.md#effect-only-entities) |
 | `zone-names` | `MOG_HOUSE_NAMES` in `xi.zone.xi_list` | Hand-verified names on mog-house rows in `zones.json`, matched by path; ids, fileIds and custom zones are left alone |
 | `file-ids` | reverse FTABLE/VTABLE | `fileId` on every row in every list |
-| `abilities` | every job-ability (4412+N), spell (`0xAF0`+anim) and weapon-skill (both banks, per race) DAT, named from `abilities.sql` / `weapon_skills.sql` / `mob_skills.sql` | Full rebuild of `abilities.json`, the Ability Mixer's pick list: per entry its DAT(s), generators, audio generators, sound pointers, clips and routine length. Real names from a previous run are kept when this machine has no server SQL. ~1 minute (see [../ability/mixer.md](../ability/mixer.md)) |
+| `abilities` | every job-ability (4412+N), spell (`0xAF0`+anim) and weapon-skill (both banks, per race) DAT, named from `abilities.sql` / `weapon_skills.sql` / `mob_skills.sql` | Full rebuild of `abilities.json`, the Ability Mixer's pick list: per entry its DAT(s), generators, audio generators, sound pointers, clips and routine length, plus `base_motions` — the race base's cast and job-ability motions, each with the stages retail plays (chant, release, follow-through) read from the base's own schedules. Real names from a previous run are kept when this machine has no server SQL. ~1 minute (see [../ability/mixer.md](../ability/mixer.md)) |
 | _(always, last)_ | the lists themselves | `manifest.json` — one sha256 + byte count per JSON beside it. Not opt-in: this is what publishes a list to the model viewer (see above) |
 
 Not covered: `floors.json`, and a full `zones.json` regeneration (new or renamed named
@@ -166,6 +166,12 @@ itself. Blocks are the client's rotate-left-3 "encryption", undone here.
 `jobs`, `spells`, `abilities`, `status`, `mounts`, `augments`, `merits`, `trust`, …):
 rows are `{idx, offset, length, subs}`; `subs` is a list of decoded text, or the integer
 marker for a non-text sub-string.
+
+**Spell and ability data** (`spellData`, `abilityData`): the spell and command records of
+`ROM/118/114.DAT`, one per non-empty record, `{idx, offset, name, help, fields, levels, hex}` —
+the decoded fields (`xi.menu.xi_menu_table`), the jobs that learn a spell, the record's bytes,
+and the name and help from the language's `spells` / `spellHelp` or `abilities` / `abilityHelp`.
+The viewer shows them under *Spells & Abilities*.
 
 The table registry, block layouts and row shapes mirror `ui/js/database.js` in
 xi-model-viewer and must stay in step with it.

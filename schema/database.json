@@ -1,0 +1,1673 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xi.tools/schema/database.json",
+  "title": "xi dats database action",
+  "description": "Edits to the client's record tables — the tables the model viewer's Database shows (items by category, key items, titles, quests, spell and ability text, …) — each addressed by table and id, with an optional proposed SQL change for the item's server rows. Only the fields an edit names change. Works on legacy (0xC00) and retail (0x1400) item DATs alike: the build finds the record's DAT, English and Japanese, detects its format and patches the copy the client loads.",
+  "allOf": [
+    {
+      "$ref": "common.json#/$defs/baseAction"
+    }
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "type",
+    "edits"
+  ],
+  "properties": {
+    "id": {
+      "$ref": "common.json#/$defs/actionId"
+    },
+    "type": {
+      "type": "string",
+      "const": "database"
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "description": {
+      "type": "string"
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "$ref": "common.json#/$defs/actionId"
+      },
+      "uniqueItems": true
+    },
+    "edits": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/edit"
+          },
+          {
+            "$ref": "#/$defs/addEdit"
+          }
+        ]
+      }
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The proposed SQL for the edits' server rows. It is written, never run.",
+      "properties": {
+        "emit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Write the SQL file at all."
+        },
+        "mirror": {
+          "type": "boolean",
+          "default": true,
+          "description": "Carry the fields both sides hold into the SQL: flags and stack (item_basic), level, itemLevel (ilevel), superiorLevel (su_level), jobs, slots (slot) and shieldSize (item_equipment), damage (dmg), delay and skill (item_weapon). A column an edit's `server` block names wins over the mirrored value."
+        },
+        "sql": {
+          "type": "string",
+          "pattern": "\\.sql$",
+          "description": "Where the SQL goes, relative to the file holding this action. Default: the project's name with .sql, next to the project file (projects/abyssea.json -> projects/abyssea.sql)."
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Recorded by dats build: per build target (dir, pivot), every record it wrote with each changed field's value before and after — what a rebuild starts from and undo puts back.",
+      "properties": {
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sql": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "roots": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "table": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "lang": {
+                  "type": "string",
+                  "enum": [
+                    "en",
+                    "jp"
+                  ]
+                },
+                "dat": {
+                  "$ref": "common.json#/$defs/romPath"
+                },
+                "format": {
+                  "type": "string",
+                  "enum": [
+                    "legacy",
+                    "retail"
+                  ]
+                },
+                "block": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "name": {
+                  "type": "string"
+                },
+                "created": {
+                  "type": "boolean"
+                },
+                "before_block": {
+                  "type": "string",
+                  "description": "A created item record: the slot's bytes before (base64)."
+                },
+                "sha1": {
+                  "type": "string"
+                },
+                "changed": {
+                  "type": "object",
+                  "description": "field -> {from, to}"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "outputs": {
+      "$ref": "common.json#/$defs/outputTree"
+    }
+  },
+  "$defs": {
+    "edit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "id"
+      ],
+      "properties": {
+        "table": {
+          "description": "The viewer's table key (ui/js/database.js, xi.mv.xi_database). Item tables: general, usable, puppet, armor, weapons, maze, monst1, items7, roeObj, items6, gil. d_msg tables: the quest (q_*) and mission (m_*) logs, keyitems, titles, jobs, spells, spellHelp, abilities, abilityHelp, bluHelp, status, mounts, mountHelp, monsterFamilies, slots, augments, merits, jobPoints, jobGifts, soulplates, trust, emoteHelp, chatHelp, mazeRunes, headings, servers. Spell and command records of ROM/118/114.DAT (one file for every client language): spellData, abilityData. Any other table may be given by its ROM path, one file whatever the language, a row by its index: a d_msg table (ROM/181/72.DAT), its sub-strings sub0, sub1, …; or an item table with `layout`, the layout of its records (a table a server grew or added, ROM/288/80.DAT row 1030), its strings sub0, sub1, … by position.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "general",
+                "usable",
+                "puppet",
+                "armor",
+                "weapons",
+                "maze",
+                "monst1",
+                "items7",
+                "roeObj",
+                "items6",
+                "gil",
+                "q_sandoria",
+                "q_bastok",
+                "q_windurst",
+                "q_jeuno",
+                "q_other",
+                "q_toau",
+                "q_wotg",
+                "q_abyssea",
+                "q_assault",
+                "q_campaign",
+                "q_adoulin",
+                "q_coalition",
+                "m_sandoria",
+                "m_bastok",
+                "m_windurst",
+                "m_zilart",
+                "m_cop",
+                "m_toau",
+                "m_wotg",
+                "m_acp",
+                "m_amk",
+                "m_asa",
+                "m_adoulin",
+                "m_rov",
+                "keyitems",
+                "titles",
+                "jobs",
+                "spells",
+                "spellHelp",
+                "abilities",
+                "abilityHelp",
+                "bluHelp",
+                "status",
+                "mounts",
+                "mountHelp",
+                "monsterFamilies",
+                "slots",
+                "augments",
+                "merits",
+                "jobPoints",
+                "jobGifts",
+                "soulplates",
+                "trust",
+                "emoteHelp",
+                "chatHelp",
+                "mazeRunes",
+                "headings",
+                "servers",
+                "spellData",
+                "abilityData"
+              ]
+            },
+            {
+              "type": "string",
+              "pattern": "^[Rr][Oo][Mm][0-9]*/[0-9]+/[0-9]+\\.[Dd][Aa][Tt]$"
+            }
+          ]
+        },
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Item tables: the item id; the id decides which DAT of the table holds it (armor 10240-16383 -> ROM/118/109, 23040-28671 -> ROM/286/73). d_msg tables: the row index, except where each row carries its own id (keyitems, the q_* and m_* logs), where it is that id. spellData / abilityData: the spell or command id (the record index)."
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "general",
+            "usable",
+            "puppet",
+            "armor",
+            "weapon",
+            "maze",
+            "instinct",
+            "roe"
+          ],
+          "description": "An item table given by its ROM path: the layout of its records (which header fields `set` names and where the strings are). A record copied in (copy_from, a row of the same file) takes the donor's id moved by as many rows. No server side."
+        },
+        "copy_from": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Create the record as a copy of another. Item tables: copy record `copy_from` of the same table into slot `id` (replacing what it holds), then apply this edit (the proposed SQL copies the donor's server rows the same way). Text tables: add row `id` past the end, copying row `copy_from` (the rows in between hold '.'), or for key items and the quest / mission logs a new id, copying the record with id `copy_from`. A new text row goes in both languages; the Japanese one takes the English text unless strings.jp gives its own. spellData / abilityData: copy that record into slot `id` (past the end grows the section, as a client that reads them needs)."
+        },
+        "note": {
+          "type": "string",
+          "description": "Why — kept in the changelog."
+        },
+        "set": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/set"
+            },
+            {
+              "$ref": "#/$defs/menuSet"
+            }
+          ]
+        },
+        "strings": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "en": {
+                  "$ref": "#/$defs/strings"
+                },
+                "jp": {
+                  "$ref": "#/$defs/strings"
+                }
+              }
+            },
+            {
+              "$ref": "#/$defs/subStrings"
+            }
+          ]
+        },
+        "icon": {
+          "$ref": "#/$defs/icon"
+        },
+        "server": {
+          "description": "Item tables: the item's server rows, or false to leave the server out of this edit (no mirroring either). spellData: false only — its spell_list row is mirrored from mp, cast, recast, element, skill and levels unless the action's server.mirror is off.",
+          "oneOf": [
+            {
+              "type": "boolean",
+              "const": false
+            },
+            {
+              "$ref": "#/$defs/serverRows"
+            }
+          ]
+        },
+        "hex": {
+          "description": "The whole record, exactly: item tables the decrypted record (0xC00 legacy / 0x1400 retail bytes), d_msg tables the block, spell / command records the decoded record (0x64 / 0x30 bytes). Per language for the named item and d_msg tables; one text for a record of 114.DAT or a table by path. Given alone: no set, strings, icon or copy_from. Undo puts the record back as it was.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hexText"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "en": {
+                  "$ref": "#/$defs/hexText"
+                },
+                "jp": {
+                  "$ref": "#/$defs/hexText"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "set": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Record header fields, by the viewer's names. Which ones a table has depends on its layout: every item table has flags, stack, type, resourceId and targets; armor and weapons add level, slots, races, jobs, superiorLevel, maxCharges, castTime, useDelay, reuseDelay and itemLevel; armor adds shieldSize; weapons add damage, delay, dps, skill, jugSize and baseItemId; usable has castTime; puppet has puppetSlot and elementCharge; monst1 has level, races and instinctCost. Header bytes no one has named yet are unknown_<offset> (legacy records only): general unknown_0e–16, usable unknown_10–1a, armor unknown_24/28/2a, weapon unknown_1a/24/26/34/36, maze unknown_0e–52.",
+      "properties": {
+        "flags": {
+          "$ref": "#/$defs/flags"
+        },
+        "stack": {
+          "$ref": "#/$defs/u16"
+        },
+        "type": {
+          "$ref": "#/$defs/u16",
+          "description": "Item type (1 item, 4 weapon, 5 armor, 7 usable, 10 furnishing, …)."
+        },
+        "resourceId": {
+          "$ref": "#/$defs/u16"
+        },
+        "targets": {
+          "$ref": "#/$defs/u16"
+        },
+        "level": {
+          "$ref": "#/$defs/u16"
+        },
+        "slots": {
+          "$ref": "#/$defs/slots"
+        },
+        "races": {
+          "$ref": "#/$defs/races"
+        },
+        "jobs": {
+          "$ref": "#/$defs/jobs"
+        },
+        "superiorLevel": {
+          "$ref": "#/$defs/u16"
+        },
+        "shieldSize": {
+          "$ref": "#/$defs/u16"
+        },
+        "maxCharges": {
+          "$ref": "#/$defs/u16"
+        },
+        "castTime": {
+          "$ref": "#/$defs/u16"
+        },
+        "useDelay": {
+          "$ref": "#/$defs/u16"
+        },
+        "reuseDelay": {
+          "$ref": "#/$defs/u16"
+        },
+        "itemLevel": {
+          "$ref": "#/$defs/u16"
+        },
+        "damage": {
+          "$ref": "#/$defs/u16"
+        },
+        "delay": {
+          "$ref": "#/$defs/u16"
+        },
+        "dps": {
+          "$ref": "#/$defs/u16",
+          "description": "Damage x 6000 / delay; the build derives it when damage or delay changes and dps isn't given."
+        },
+        "skill": {
+          "$ref": "#/$defs/skill"
+        },
+        "jugSize": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "baseItemId": {
+          "$ref": "#/$defs/u16"
+        },
+        "puppetSlot": {
+          "$ref": "#/$defs/u16"
+        },
+        "elementCharge": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "instinctCost": {
+          "$ref": "#/$defs/u16"
+        },
+        "unknown_0e": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_10": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_12": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_14": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_16": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_18": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_1a": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_1c": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_1e": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_20": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_22": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_24": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_26": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_28": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_2a": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_2c": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_2e": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_30": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_32": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_34": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_36": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_38": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_3a": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_3c": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_3e": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_40": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_42": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_44": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_46": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_48": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_4a": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_4c": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_4e": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_50": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        },
+        "unknown_52": {
+          "$ref": "#/$defs/u16",
+          "description": "A header value nobody has named yet (its byte offset in a legacy record, hex)."
+        }
+      }
+    },
+    "strings": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The record's sub-strings, by the viewer's names. Items: name, article, logName, logPlural, description in English; name and description in Japanese. d_msg tables name theirs per table (quests: name, description; key items: name, plural, description, category; the help tables: help; the Japanese key items keep only name and description, the Japanese status names only name; …). A sub-string not named is kept byte for byte. Text is written as the client shows it with \\n for a line break; {Fire} {Ice} {Wind} {Earth} {Lightning} {Water} {Light} {Dark} are the element icons, {at:xxxxxxxx} an auto-translate phrase and {x:hh} a byte cp932 can't show (the changelog shows record text the same way).",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "article": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "description": "0 a, 1 an, 2 a pair of, 3 a suit of."
+        },
+        "logName": {
+          "$ref": "#/$defs/text"
+        },
+        "logPlural": {
+          "$ref": "#/$defs/text"
+        },
+        "description": {
+          "$ref": "#/$defs/text"
+        },
+        "plural": {
+          "$ref": "#/$defs/text"
+        },
+        "help": {
+          "$ref": "#/$defs/text"
+        },
+        "adjective": {
+          "$ref": "#/$defs/text"
+        },
+        "text": {
+          "$ref": "#/$defs/text"
+        },
+        "format": {
+          "$ref": "#/$defs/text"
+        },
+        "category": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "keyItem": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "text": {
+      "description": "The new text, or {\"replace\": {old: new}} to change part of the record's original text (the rest, element icons included, stays as it is).",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "replace"
+          ],
+          "properties": {
+            "replace": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "serverRows": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Columns of the item's rows in the server tables, by the server's own names. item_mods changes only the mods it names (null removes one); item_mods_pet and item_latents list the item's complete set and replace what the server has.",
+      "properties": {
+        "item_basic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "subid": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "sortname": {
+              "type": "string"
+            },
+            "type": {
+              "type": "integer"
+            },
+            "stackSize": {
+              "type": "integer"
+            },
+            "flags": {
+              "$ref": "#/$defs/flags"
+            },
+            "aH": {
+              "type": "integer"
+            },
+            "BaseSell": {
+              "type": "integer"
+            }
+          }
+        },
+        "item_equipment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "level": {
+              "type": "integer"
+            },
+            "ilevel": {
+              "type": "integer"
+            },
+            "jobs": {
+              "$ref": "#/$defs/jobs"
+            },
+            "MId": {
+              "description": "Gear model id, or the gear action whose recorded model id to use.",
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4095
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "gear"
+                  ],
+                  "properties": {
+                    "gear": {
+                      "$ref": "common.json#/$defs/actionId"
+                    }
+                  }
+                }
+              ]
+            },
+            "shieldSize": {
+              "type": "integer"
+            },
+            "scriptType": {
+              "type": "integer"
+            },
+            "slot": {
+              "$ref": "#/$defs/slots"
+            },
+            "rslot": {
+              "$ref": "#/$defs/slots"
+            },
+            "rslotlook": {
+              "type": "integer"
+            },
+            "su_level": {
+              "type": "integer"
+            }
+          }
+        },
+        "item_weapon": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "skill": {
+              "$ref": "#/$defs/skill"
+            },
+            "subskill": {
+              "type": "integer"
+            },
+            "ilvl_skill": {
+              "type": "integer"
+            },
+            "ilvl_parry": {
+              "type": "integer"
+            },
+            "ilvl_macc": {
+              "type": "integer"
+            },
+            "dmgType": {
+              "type": "integer"
+            },
+            "hit": {
+              "type": "integer"
+            },
+            "delay": {
+              "type": "integer"
+            },
+            "dmg": {
+              "type": "integer"
+            },
+            "unlock_points": {
+              "type": "integer"
+            }
+          }
+        },
+        "item_mods": {
+          "type": "object",
+          "description": "Mod name (xi.mod, the server's scripts/enum/mod.lua) -> value, or null to remove that mod. Mods not named stay as they are.",
+          "additionalProperties": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "item_mods_pet": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mod",
+              "value"
+            ],
+            "properties": {
+              "mod": {
+                "$ref": "#/$defs/modName"
+              },
+              "value": {
+                "type": "integer"
+              },
+              "petType": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "item_latents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mod",
+              "value",
+              "latentId"
+            ],
+            "properties": {
+              "mod": {
+                "$ref": "#/$defs/modName"
+              },
+              "value": {
+                "type": "integer"
+              },
+              "latentId": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "latentParam": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "item_usable": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "validTargets": {
+              "type": "integer"
+            },
+            "activation": {
+              "type": "integer"
+            },
+            "animation": {
+              "type": "integer"
+            },
+            "animationTime": {
+              "type": "integer"
+            },
+            "maxCharges": {
+              "type": "integer"
+            },
+            "useDelay": {
+              "type": "integer"
+            },
+            "reuseDelay": {
+              "type": "integer"
+            },
+            "aoe": {
+              "type": "integer"
+            }
+          }
+        },
+        "item_furnishing": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "storage": {
+              "type": "integer"
+            },
+            "moghancement": {
+              "type": "integer"
+            },
+            "element": {
+              "type": "integer"
+            },
+            "aura": {
+              "type": "integer"
+            }
+          }
+        },
+        "item_info": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "CatsEyeXI's item_info (modules sql/custom): the icon to borrow and a description, for the website.",
+          "properties": {
+            "icon": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "desc": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "u16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "modName": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*$"
+    },
+    "jobName": {
+      "type": "string",
+      "enum": [
+        "WAR",
+        "MNK",
+        "WHM",
+        "BLM",
+        "RDM",
+        "THF",
+        "PLD",
+        "DRK",
+        "BST",
+        "BRD",
+        "RNG",
+        "SAM",
+        "NIN",
+        "DRG",
+        "SMN",
+        "BLU",
+        "COR",
+        "PUP",
+        "DNC",
+        "SCH",
+        "GEO",
+        "RUN"
+      ]
+    },
+    "jobs": {
+      "description": "Job names, or \"all\". The DAT stores WAR at bit 1, the server at bit 0; the build encodes each side.",
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "all"
+        },
+        {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/jobName"
+          }
+        }
+      ]
+    },
+    "races": {
+      "description": "Race names, or \"all\" (DAT bits 1-8).",
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "all"
+        },
+        {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "HUME_M",
+              "HUME_F",
+              "ELVAAN_M",
+              "ELVAAN_F",
+              "TARU_M",
+              "TARU_F",
+              "MITHRA",
+              "GALKA"
+            ]
+          }
+        }
+      ]
+    },
+    "slots": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Equipment slots (bit 0 MAIN … bit 15 BACK, the same bits in the DAT and item_equipment.slot).",
+      "items": {
+        "type": "string",
+        "enum": [
+          "MAIN",
+          "SUB",
+          "RANGED",
+          "AMMO",
+          "HEAD",
+          "BODY",
+          "HANDS",
+          "LEGS",
+          "FEET",
+          "NECK",
+          "WAIST",
+          "EAR1",
+          "EAR2",
+          "RING1",
+          "RING2",
+          "BACK"
+        ]
+      }
+    },
+    "flags": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Item flags: the server's ITEM_FLAG names (src/map/items/item.h), the same bits in the DAT and item_basic.flags.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "WALLHANGING",
+          "UNKNOWN_01",
+          "MYSTERY_BOX",
+          "MOG_GARDEN",
+          "MAIL2ACCOUNT",
+          "INSCRIBABLE",
+          "NOAUCTION",
+          "SCROLL",
+          "LINKSHELL",
+          "CANUSE",
+          "CANTRADENPC",
+          "CANEQUIP",
+          "NOSALE",
+          "NODELIVERY",
+          "EX",
+          "RARE"
+        ]
+      }
+    },
+    "skill": {
+      "description": "Weapon skill: a name, or its number for one without a name here.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "NONE",
+            "HAND_TO_HAND",
+            "DAGGER",
+            "SWORD",
+            "GREAT_SWORD",
+            "AXE",
+            "GREAT_AXE",
+            "SCYTHE",
+            "POLEARM",
+            "KATANA",
+            "GREAT_KATANA",
+            "CLUB",
+            "STAFF",
+            "ARCHERY",
+            "MARKSMANSHIP",
+            "THROWING",
+            "STRING_INSTRUMENT",
+            "WIND_INSTRUMENT",
+            "HANDBELL",
+            "FISHING"
+          ]
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      ]
+    },
+    "menuSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Fields of a spell (spellData) or command (abilityData) record, as xi.menu.xi_menu_table reads them. Spells: kind, element, targets, skill, mp, cast and recast (quarter seconds), menu_index, icon, icon2, requirements, and levels. Commands: type, icon, icon2, charges, targets, tp, level, range, radius, aoe, valid_targets, tp_modifier. Bytes nobody has named yet are unknown_<offset> (spells unknown_45–62, commands unknown_08–2e).",
+      "properties": {
+        "targets": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "skill": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "mp": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "menu_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "icon": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "icon2": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "charges": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "tp": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "valid_targets": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "cast": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "recast": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "requirements": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "type": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "range": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "radius": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "aoe": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "tp_modifier": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "kind": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            {
+              "enum": [
+                "white",
+                "black",
+                "summon",
+                "ninjutsu",
+                "song",
+                "blue",
+                "geomancy",
+                "trust"
+              ]
+            }
+          ]
+        },
+        "element": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            {
+              "enum": [
+                "fire",
+                "ice",
+                "wind",
+                "earth",
+                "lightning",
+                "water",
+                "light",
+                "dark",
+                "none"
+              ]
+            }
+          ]
+        },
+        "levels": {
+          "type": "object",
+          "description": "The jobs that can learn the spell, merged into the record's: {\"WHM\": 1}; null takes a job off. MON is the Monstrosity column.",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65534
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "unknown_45": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_46": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_48": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_4a": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_4c": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_4e": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_50": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_52": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_54": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_56": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_58": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_5a": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_5c": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_5e": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_60": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_62": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_08": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_0e": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_16": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_18": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_1a": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_1c": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_1e": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_20": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_22": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_24": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_26": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_28": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_2a": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_2c": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        },
+        "unknown_2e": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "A record value nobody has named yet (its byte offset, hex)."
+        }
+      }
+    },
+    "subStrings": {
+      "type": "object",
+      "description": "A table by path: its sub-strings by position, sub0, sub1, … — text (as in strings), {\"replace\": {…}}, or a number where the sub-string is one.",
+      "propertyNames": {
+        "pattern": "^sub[0-9]+$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/text"
+          },
+          {
+            "type": "integer",
+            "minimum": 0
+          }
+        ]
+      }
+    },
+    "hexText": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F ]+$"
+    },
+    "icon": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Item tables only: the 32x32 icon — copied from another item (from), or a 256-colour .bmp file (file, relative to the file holding the action) stored after a 16-character tag.",
+      "properties": {
+        "from": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Item id whose icon to copy."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "\\.[bB][mM][pP]$",
+          "description": "A .bmp file, relative to the file holding the action."
+        },
+        "tag": {
+          "type": "string",
+          "maxLength": 16,
+          "description": "The icon's 16-character tag (default \"item    custom\")."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "from"
+          ]
+        },
+        {
+          "required": [
+            "file"
+          ]
+        }
+      ]
+    },
+    "addEdit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "add"
+      ],
+      "description": "Whole item records made from fields, into an item table: a named one, or a ROM path with its layout (table_jp: the Japanese file). An item with an id replaces that item; one without goes into the next empty row, and is skipped when the table already has an item of its English name (case-insensitive).",
+      "properties": {
+        "table": {
+          "type": "string",
+          "description": "An item table key (general, armor, …) or an item DAT's ROM path (the English file)."
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "general",
+            "usable",
+            "puppet",
+            "armor",
+            "weapon",
+            "maze",
+            "instinct",
+            "roe"
+          ],
+          "description": "A table by path: the layout of its records."
+        },
+        "table_jp": {
+          "$ref": "common.json#/$defs/romPath",
+          "description": "A table by path: its Japanese file."
+        },
+        "note": {
+          "type": "string"
+        },
+        "add": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The item id: this item is replaced. Without it the item goes into the next empty row."
+              },
+              "layout": {
+                "type": "string",
+                "enum": [
+                  "general",
+                  "usable",
+                  "puppet",
+                  "armor",
+                  "weapon",
+                  "maze",
+                  "instinct",
+                  "roe"
+                ],
+                "description": "This item's layout, when it isn't the table's."
+              },
+              "set": {
+                "$ref": "#/$defs/set"
+              },
+              "strings": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "en": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "article": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "logName": {
+                        "type": "string"
+                      },
+                      "logPlural": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "jp": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              },
+              "icon": {
+                "$ref": "#/$defs/icon"
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "id": "database.gear_tweaks",
+      "type": "database",
+      "description": "Decennial Coat +1 at level 50, Scorpion Harness at HP+30, a new earring copied from Moonshade Earring and a key item reworded. Cure costs 5 MP and Red Mage learns it at 1.",
+      "server": {
+        "emit": true,
+        "mirror": true
+      },
+      "edits": [
+        {
+          "table": "armor",
+          "id": 10253,
+          "note": "Level 50 coat",
+          "set": {
+            "level": 50
+          }
+        },
+        {
+          "table": "armor",
+          "id": 12579,
+          "note": "HP+15 -> HP+30",
+          "strings": {
+            "en": {
+              "description": {
+                "replace": {
+                  "HP+15": "HP+30"
+                }
+              }
+            }
+          },
+          "server": {
+            "item_mods": {
+              "HP": 30
+            }
+          }
+        },
+        {
+          "table": "armor",
+          "id": 10294,
+          "copy_from": 11697,
+          "set": {
+            "level": 75,
+            "flags": [
+              "RARE",
+              "EX",
+              "CANEQUIP"
+            ],
+            "races": "all"
+          },
+          "strings": {
+            "en": {
+              "name": "Abyssal Earring",
+              "article": 1,
+              "logName": "abyssal earring",
+              "logPlural": "abyssal earrings",
+              "description": "Accuracy+5 Attack+5"
+            },
+            "jp": {
+              "name": "アビサルピアス",
+              "description": "命中+5 攻+5"
+            }
+          },
+          "icon": {
+            "from": 11697
+          },
+          "server": {
+            "item_mods": {
+              "ACC": 5,
+              "ATT": 5
+            }
+          }
+        },
+        {
+          "table": "keyitems",
+          "id": 1,
+          "strings": {
+            "en": {
+              "description": "A report on the morale of the Galka working the Zeruhn Mines."
+            }
+          }
+        },
+        {
+          "table": "spellData",
+          "id": 1,
+          "note": "A cheaper Cure",
+          "set": {
+            "mp": 5,
+            "levels": {
+              "RDM": 1
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

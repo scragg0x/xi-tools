@@ -11,17 +11,19 @@ from pathlib import Path
 
 import click
 
+from xi.dats.xi_include import INCLUDE_SCHEMA, LAYOUT_KEY, IncludeError, documents, flatten
+
 
 DEFAULT_MANIFEST = Path("projects/update.json")
 
 
 def _resolve_manifest_path(manifest: Path | None, project: str | None) -> Path:
-    """Resolve a manifest to a `dats/*.json` path.
+    """Resolve a manifest to a `projects/*.json` path.
 
     A bare **project name** — whether passed positionally (`dats build gyokko_mask`)
-    or via `--project gyokko_mask` — resolves to `dats/<name>.json`, matching the
+    or via `--project gyokko_mask` — resolves to `projects/<name>.json`, matching the
     project semantics of `dats new`. An explicit path (has a directory part or a
-    `.json` suffix) is used verbatim. Falls back to `dats/update.json`."""
+    `.json` suffix) is used verbatim. Falls back to `projects/update.json`."""
     if manifest is not None:
         p = Path(manifest)
         # Bare name (no directory component, no suffix) → treat as a project name.
@@ -151,6 +153,12 @@ def _read_manifest(path: Path) -> dict:
     roots.setdefault("resources", "projects/resources")
     roots.pop("changelog", None)  # results now live inline on each action (was a side file)
     manifest.setdefault("actions", [])
+    if any(isinstance(a, str) for a in manifest["actions"]):
+        # Includes: splice each file's actions in; _write_manifest puts them back.
+        try:
+            manifest["actions"], manifest[LAYOUT_KEY] = flatten(path, manifest["actions"])
+        except IncludeError as exc:
+            raise click.ClickException(str(exc)) from exc
     for action in manifest["actions"]:
         if isinstance(action, dict):
             action.pop("op", None)  # `op` is unused — dropped on read so it's shed on next write
@@ -158,8 +166,18 @@ def _read_manifest(path: Path) -> dict:
 
 
 def _write_manifest(path: Path, manifest: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    """Write the project file, and each include file it was read with whose content
+    changed (a build's `result` goes back beside the action that earned it; an untouched
+    include keeps its own formatting)."""
+    for file, doc in documents(path, manifest).items():
+        if file != path and file.exists():
+            try:
+                if json.loads(file.read_text(encoding="utf-8")) == doc:
+                    continue
+            except ValueError:
+                pass
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _root_path(manifest_path: Path, manifest: dict, key: str) -> Path:
@@ -214,6 +232,13 @@ def _plan_result(action: dict) -> dict:
         if isinstance(mid, int):
             res["file_id"] = file_id_for(mid)
             res["key_item"] = key_item_for(mid) if has_ki else None
+        return res
+
+    if kind == "copy":
+        from xi.dats.xi_copy import rel_path
+        res = {"path": rel_path(target.get("path"))}
+        if target.get("file_id") is not None:
+            res["file_id"] = target["file_id"]
         return res
 
     return {}
@@ -300,7 +325,7 @@ def _set_target_root(root: Path | None) -> None:
 
 
 # Build/package target names -> (label, config var name).
-_TARGET_LABELS = {"pivot": "Pivot overlay", "hd": "HD overlay", "dir": "Base install"}
+_TARGET_LABELS = {"pivot": "Pivot folder", "hd": "HD overlay", "dir": "Base install"}
 
 
 def _target_root(target: str) -> Path:
@@ -346,7 +371,13 @@ def _ftable_entries(ft: Path) -> int:
 
 def _backup_once(path: Path) -> None:
     """Copy a table to <name>.base once before its first modification, so the
-    change stays recoverable (matches `xi ftable reset`'s .base backups)."""
+    change stays recoverable (matches `xi ftable reset`'s .base backups). In the
+    install only: a pivot folder keeps no .base."""
+    from xi.xi_config import FFXI_DIR
+    try:
+        Path(path).resolve().relative_to(Path(FFXI_DIR).resolve())
+    except ValueError:
+        return
     base = path.with_name(path.name + ".base")
     if path.exists() and not base.exists():
         shutil.copy2(path, base)
@@ -369,34 +400,76 @@ def _patch_raw_table(ft: Path, vt: Path, file_id: int, ftval: int, vt_val: int) 
     with open(vt, "r+b") as f:
         f.seek(file_id)
         f.write(bytes([vt_val & 0xFF]))
+    from xi.ftable.xi_core import forget_tables
+    forget_tables()
+
+
+def _table_holds(ft: Path, vt: Path, file_id: int) -> bool:
+    """Both tables exist and are large enough to carry ``file_id``."""
+    return (ft.exists() and vt.exists()
+            and ft.stat().st_size >= (file_id + 1) * 2 and vt.stat().st_size >= file_id + 1)
 
 
 def patch_launcher_tables(file_id: int, ftval: int, rom: int) -> None:
-    """Register file_id -> placement in the active target's base + ROM{rom} tables.
-    A target with no FTABLE (e.g. the HD overlay) is a DAT-only drop — the file_id
-    registration comes from another target's tables — so skip patching there."""
+    """Register file_id -> placement in the active target, in the table pair the client
+    resolves it through (xi.ftable.xi_core.resolve_dat_in_root).
+
+    A ROM{n} placement registers in the target's ROM{n} pair: the client honours that
+    entry over the main FTABLE/VTABLE, and reads a pivot folder's ROM{n} pair in place
+    of the install's. The target's main pair gets the same entry when it is large enough
+    (a retail-sized main FTABLE is left alone instead of failing the build): the base
+    install's for the tools that read only that pair, and a pivot folder's when it carries
+    one — the client never reads it from there, so such a pair is the base game's, kept
+    with the pivot folder to ship to the install (CatsEyeXI's dats keeps it in rom/).
+
+    A ROM/ placement registers in the main pair, which counts only in the base install;
+    ``_check_registrable`` refuses one that would need a new entry anywhere else."""
     root = _active_build_root()
-    if not (root / "FTABLE.DAT").exists():
+    in_install = _root_target_name(root) == "dir"
+    main_ft, main_vt = root / "FTABLE.DAT", root / "VTABLE.DAT"
+    if rom == 1:
+        if in_install:
+            _patch_raw_table(main_ft, main_vt, file_id, ftval, rom)
         return
-    _patch_raw_table(root / "FTABLE.DAT", root / "VTABLE.DAT", file_id, ftval, rom)
-    if rom != 1:
-        _patch_raw_table(root / f"ROM{rom}" / f"FTABLE{rom}.DAT",
-                         root / f"ROM{rom}" / f"VTABLE{rom}.DAT", file_id, ftval, rom)
+    rom_ft, rom_vt = root / f"ROM{rom}" / f"FTABLE{rom}.DAT", root / f"ROM{rom}" / f"VTABLE{rom}.DAT"
+    if not (rom_ft.exists() and rom_vt.exists()):
+        raise click.ClickException(
+            f"{root} has no ROM{rom} tables, so file_id {file_id:,} cannot be registered there. "
+            f"Run `xi ftable expand` on it, or build into a folder that has ROM{rom}/FTABLE{rom}.DAT.")
+    _patch_raw_table(rom_ft, rom_vt, file_id, ftval, rom)
+    if _table_holds(main_ft, main_vt, file_id):
+        try:
+            _patch_raw_table(main_ft, main_vt, file_id, ftval, rom)
+        except PermissionError:
+            pass   # the copy for main-pair readers only; the ROM{rom} entry is registered
 
 
 def _patch_active_tables(file_id: int, ftval: int, rom: int) -> None:
     patch_launcher_tables(file_id, ftval, rom)
 
 
+def _check_registrable(file_id: int, place_rel: str, rom: int, action_id: str) -> None:
+    """Refuse, before anything is written, a ROM/ placement outside the base install
+    that needs a new main FTABLE entry: the client reads the main pair only from the
+    install, so an entry in a pivot folder would never count. When the client already
+    resolves file_id to that path, the DAT alone overrides the file and passes."""
+    if rom != 1 or _root_target_name(_active_build_root()) == "dir":
+        return
+    from xi.ftable.xi_core import resolve_dat_in_root
+    from xi.xi_config import FFXI_DIR
+    current, _ = resolve_dat_in_root(FFXI_DIR, file_id)
+    if (current or "").upper() != place_rel.upper():
+        raise click.ClickException(
+            f"{action_id}: {place_rel} is a ROM/ placement, which registers in the main FTABLE — and "
+            "the client reads that only from the base install, never from the pivot folder. Build it "
+            "without --pivot, or place it under ROM10.")
+
+
 def _active_placement(file_id: int) -> str | None:
-    """What file_id is registered to in the active target's tables (collision check)."""
-    from xi.ftable.xi_core import resolve_dat
-    root = _active_build_root()
-    ft, vt = root / "FTABLE.DAT", root / "VTABLE.DAT"
-    if not ft.exists() or not vt.exists():
-        return None
-    dat, _ = resolve_dat(ft.read_bytes(), vt.read_bytes(), file_id)
-    return dat
+    """What file_id resolves to for a client reading through the active target (the
+    collision check): its ROM{n} pair first, then the install's main pair."""
+    from xi.ftable.xi_core import resolve_dat_in_root
+    return resolve_dat_in_root(_active_build_root(), file_id)[0]
 
 
 def _current_launcher_placement(file_id: int) -> str | None:
@@ -477,8 +550,31 @@ def _detect_source_type(source: Path, explicit_type: str | None) -> tuple[str, d
     data = _load_json(source)
     if explicit_type:
         return explicit_type, data
+    # Database edits: a bare list of them, or {"edits": [...]} (schema/database.json).
+    if isinstance(data, list):
+        if all(isinstance(e, dict) and "table" in e for e in data):
+            return "database", data
+        raise click.ClickException(f"Cannot infer action type for {source}. Pass --type.")
+    if isinstance(data.get("edits"), list) and not data.get("type"):
+        return "database", data
+    # A zone's dialog lines (schema/zone_dialog.json): {"zone", "lines"}.
+    if isinstance(data.get("lines"), list) and "zone" in data and not data.get("type"):
+        return "zone_dialog", data
+    # A zone's NPC list (schema/zone_npcs.json): {"zone", "npcs"}.
+    if isinstance(data.get("npcs"), list) and "zone" in data and not data.get("type"):
+        return "zone_npcs", data
+    # A zone's events (schema/zone_events.json): {"zone", "events"}, or one cutscene
+    # (xi.cutscene.v1 — the zone editor's, or `xi event decompile`'s).
+    from xi.event.xi_zone_events import SCHEMAS as CUTSCENE_SCHEMAS
+    if (isinstance(data.get("events"), list) and "zone" in data and not data.get("type")
+            and not isinstance(data.get("sources"), dict)) or data.get("schema") in CUTSCENE_SCHEMAS:
+        return "zone_events", data
     if source.name == "zone-changes.json" or "placements" in data or "vfx" in data or "zone" in data:
         return "zone", data
+    # A spell / command definition (schema/spell_definition.json, command_definition.json).
+    from xi.menu.xi_menu_table import DEFINITION_SCHEMAS
+    if data.get("schema") in DEFINITION_SCHEMAS:
+        return DEFINITION_SCHEMAS[data["schema"]], data
     # An ability recipe (schema/ability_recipe.json): lanes of sources + routine events.
     if isinstance(data.get("sources"), dict) and isinstance(data.get("events"), list):
         return "ability", data
@@ -724,6 +820,38 @@ def _build_mount(action: dict, manifest_path: Path, manifest: dict,
     }
 
 
+def _build_copy(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
+                dry_run: bool = False) -> dict:
+    """Put a file into the active target verbatim at target.path (xi.dats.xi_copy), and with
+    target.file_id register that id at the path in the target's tables (as a mount's model
+    is). ``dry_run`` plans without writing."""
+    from xi.dats import xi_copy as CP
+    errs = CP.validate_action(action)
+    if errs:
+        raise click.ClickException(f"{action.get('id')}:\n  " + "\n  ".join(errs))
+    src = _resolve_raw_source(action["resources"]["file"], manifest_path, manifest)
+    root = _active_build_root()
+    result = CP.place(action, src, root, in_install=_root_target_name(root) == "dir", dry_run=dry_run)
+    file_id = action["target"].get("file_id")
+    if file_id is None:
+        return result
+    rel = result["path"]
+    rom, subdir, file_idx = _parse_rom_placement(rel)
+    _check_registrable(file_id, rel, rom, action["id"])
+    existing = _active_placement(file_id)
+    collision = existing is not None and existing.upper() != rel.upper()
+    if collision and not force and not dry_run:
+        raise click.ClickException(
+            f"{action['id']}: file_id {file_id} is already registered to {existing} in the target — "
+            f"this build would repoint it to {rel}. Pass --force if that's intentional.")
+    if not dry_run:
+        _patch_active_tables(file_id, (subdir << 7) | (file_idx & 0x7F), rom)
+    result.update(file_id=file_id, registered=f"file_id {file_id} -> {rel} (rom={rom})")
+    if collision:
+        result["occupied_by"] = existing
+    return result
+
+
 def _build_mesh(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
                 dry_run: bool = False) -> dict:
     """Build an entity mesh action: rebuild the donor DAT's geometry from the
@@ -759,6 +887,8 @@ def _build_mesh(action: dict, manifest_path: Path, manifest: dict, force: bool =
         )
     rom, subdir, file_idx = _parse_rom_placement(place_rel)
     out_dat = _pivot_build_dir() / Path(*place_rel.split("/"))
+    if model.get("model_id") is not None:
+        _check_registrable(int(model["model_id"]) + MODEL_FILE_OFFSET, place_rel, rom, action["id"])
 
     result = {
         "id": action["id"], "type": "mesh", "output": str(out_dat),
@@ -846,14 +976,25 @@ def _resolve_raw_source(value: str, manifest_path: Path, manifest: dict) -> Path
                                f"{manifest_path.parent}, and CWD).")
 
 
-def _place_raw_dat_in_build(src: Path, place_rel: str, file_id: int, *, force: bool,
-                            action_id: str, dry_run: bool = False) -> dict:
-    """Copy ``src`` verbatim into the active target at ``place_rel`` and register
-    ``file_id`` -> that placement in its base + ROM{rom} tables. When ``dry_run``
-    nothing is written: the plan (incl. any occupant of file_id) is returned and
-    a collision is reported rather than raised."""
+def _file_ref(source: Path, manifest_path: Path) -> str:
+    """How an action names a file it uses where it is (not copied into resources/): relative
+    to the project file when it can be (so a repo checked out elsewhere still finds it),
+    else absolute. ``_resolve_raw_source`` reads it back."""
+    try:
+        return Path(os.path.relpath(Path(source).resolve(), manifest_path.parent.resolve())).as_posix()
+    except ValueError:                                  # another drive
+        return Path(source).resolve().as_posix()
+
+
+def _place_raw_dat_in_build(src: Path | None, place_rel: str, file_id: int, *, force: bool,
+                            action_id: str, dry_run: bool = False, data: bytes | None = None) -> dict:
+    """Copy ``src`` (or write ``data``, a DAT the build made) verbatim into the active
+    target at ``place_rel`` and register ``file_id`` -> that placement in its base +
+    ROM{rom} tables. When ``dry_run`` nothing is written: the plan (incl. any occupant
+    of file_id) is returned and a collision is reported rather than raised."""
     place_rel = _rom_rel(place_rel)
     rom, subdir, file_idx = _parse_rom_placement(place_rel)
+    _check_registrable(file_id, place_rel, rom, action_id)
     out_dat = _pivot_build_dir() / Path(*place_rel.split("/"))
     ftval = (subdir << 7) | (file_idx & 0x7F)
     existing = _active_placement(file_id)
@@ -864,13 +1005,14 @@ def _place_raw_dat_in_build(src: Path, place_rel: str, file_id: int, *, force: b
             f"target — this build would repoint it to {place_rel}. Pass "
             "--force if that's intentional.")
 
+    blob = data if data is not None else src.read_bytes()
     if not dry_run:
         out_dat.parent.mkdir(parents=True, exist_ok=True)
-        out_dat.write_bytes(src.read_bytes())
+        out_dat.write_bytes(blob)
         _patch_active_tables(file_id, ftval, rom)
 
     result = {"output": str(out_dat), "target_dat": place_rel, "file_id": file_id,
-              "rom": rom, "source": str(src), "bytes": src.stat().st_size,
+              "rom": rom, "source": str(src) if src is not None else "(built)", "bytes": len(blob),
               "registered": f"file_id {file_id} -> {place_rel} (rom={rom})"}
     if collision:
         result["occupied_by"] = existing
@@ -913,17 +1055,29 @@ ABILITY_DEFAULT_SUBDIR = 20
 
 def _ability_action_from_recipe(source: Path, resource_root: Path, *, action_id: str | None = None,
                                 kind: str | None = None, animation: int | None = None,
-                                subdir: int | None = None) -> dict:
-    """Validate a recipe, copy it under ``projects/resources/ability/`` and return the
-    manifest action for it (shared by `dats prepare` and the `dats new` wizard)."""
+                                subdir: int | None = None, animation_from: int | None = None) -> dict:
+    """Validate a recipe (a mix file, ``*.mix.json``, or a legacy ``*.recipe.json``), copy
+    it to ``projects/resources/ability/<slug>.mix.json`` and return the manifest action for
+    it (shared by `dats prepare` and the `dats new` wizard). The action id comes from the
+    recipe's ``name``, never the file name, so the viewer's ``check.LOVE.mix.json`` makes
+    ``ability.love`` like ``LOVE.mix.json`` does. A recipe whose textures name PNG files is
+    stored as load_recipe read it, each PNG inlined as its data URI, so the copy rebuilds on
+    its own; any other is copied byte for byte. An older ``<slug>.recipe.json`` copy is
+    left where it is (the action just stops pointing at it)."""
     from xi.ability.xi_compose import load_recipe
-    recipe = load_recipe(source)
+    inlined: list = []
+    recipe = load_recipe(source, inlined=inlined)
     action_id = action_id or f"ability.{_slug(recipe['name'])}"
-    dest = resource_root / "ability" / f"{action_id.removeprefix('ability.')}.recipe.json"
-    if source.resolve() != dest.resolve():
+    dest = resource_root / "ability" / f"{action_id.removeprefix('ability.')}.mix.json"
+    if inlined:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(recipe, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    elif source.resolve() != dest.resolve():
         _copy_file(source, dest)
     target: dict = {"animation": animation if animation is not None else "auto",
                     "subdir": subdir if subdir is not None else ABILITY_DEFAULT_SUBDIR}
+    if animation_from is not None:
+        target["animation_from"] = animation_from
     return {
         "id": action_id, "type": "ability",
         "kind": kind or (recipe.get("target") or {}).get("kind") or "auto",
@@ -933,14 +1087,27 @@ def _ability_action_from_recipe(source: Path, resource_root: Path, *, action_id:
     }
 
 
-def _ability_result(built: dict | None) -> dict:
-    """The inline ``result`` recorded for an ability action, from its build result."""
+#: What the server pass recorded on an ability action (the database row it owns, the
+#: client menu record it placed, the Lua stub it wrote). A build keeps them whether or
+#: not it runs the pass, so a binding is never lost (schema/ability.json result.db/menu/lua).
+ABILITY_SERVER_KEYS = ("db", "menu", "lua")
+
+
+def _ability_result(built: dict | None, previous: dict | None = None) -> dict:
+    """The inline ``result`` recorded for an ability action, from its build result, with
+    ``previous``'s ``db`` / ``menu`` / ``lua`` carried over (``undone`` is not: a build
+    after a partial undo owns its DATs again)."""
     b = built or {}
-    return {"kind": b.get("kind"), "animation": b.get("animation"),
-            "placements": [{"race": p.get("race"), "role": p.get("role"),
-                            "file_id": p.get("file_id"), "dat": p.get("dat")}
-                           for p in b.get("placements") or []],
-            "server": b.get("server")}
+    res = {"kind": b.get("kind"), "animation": b.get("animation"),
+           "placements": [{"race": p.get("race"), "role": p.get("role"),
+                           "file_id": p.get("file_id"), "dat": p.get("dat")}
+                          for p in b.get("placements") or []],
+           "server": b.get("server")}
+    if isinstance(previous, dict):
+        for key in ABILITY_SERVER_KEYS:
+            if previous.get(key) is not None:
+                res[key] = previous[key]
+    return res
 
 
 def _build_ability(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
@@ -953,20 +1120,25 @@ def _build_ability(action: dict, manifest_path: Path, manifest: dict, force: boo
     resources = action.get("resources", {})
     if not resources.get("recipe"):
         raise click.ClickException(f"{action.get('id')}: ability action needs resources.recipe.")
+    # Named first: an id that cannot name its publish folder fails before anything is placed.
+    folder = AP.publish_folder(action["id"])
     recipe_path = _resolve_raw_source(resources["recipe"], manifest_path, manifest)
     recipe = AP.load_recipe(recipe_path)
     target = action.get("target") or {}
     anim = target.get("animation", "auto")
     wanted = None if anim in (None, "auto") else int(anim)
     subdir = int(target.get("subdir", ABILITY_DEFAULT_SUBDIR))
+    start = target.get("animation_from")
     force = force or bool((action.get("options") or {}).get("force"))
     root = _active_build_root()
     plan = AP.plan(recipe, root, kind=action.get("kind"), animation=wanted, subdir=subdir,
-                   force=force, previous=action.get("result"))
+                   force=force, previous=action.get("result"),
+                   animation_from=int(start) if start is not None else None)
     sources = AP.write_sources(recipe, plan)
 
     placements = []
     try:
+        _make_room_for_band(root, [f["file_id"] for f in plan["files"]], dry_run)
         for f, src in zip(plan["files"], sources):
             # plan() already applied the slot policy (free job-ability / spell ids;
             # weapon-skill slots only where every race's DAT is a retail dummy; a
@@ -978,31 +1150,625 @@ def _build_ability(action: dict, manifest_path: Path, manifest: dict, force: boo
                      "dat": r["target_dat"], "source": r["source"], "bytes": r["bytes"]}
             cur = f.get("current")
             if cur and cur.upper() != r["target_dat"].upper() and not _is_own_previous(action, cur):
-                entry["occupied_by"] = cur
+                # A free extended slot still points at retail's placeholder DAT (a
+                # `dumm` directory); that is what makes it free, not a collision.
+                if AP.is_placeholder(root, cur):
+                    entry["placeholder"] = cur
+                else:
+                    entry["occupied_by"] = cur
             placements.append(entry)
     except PermissionError as e:
         raise click.ClickException(AP.permission_hint(root, e))
 
     sql = AP.server_snippet(recipe, plan["kind"], plan["animation"])
-    server_path = None
+    # The publish folder (projects/abilities/<slug>/) takes the SQL, a copy of each DAT
+    # just placed and placements.json, so the publish can be handed on as one folder.
+    # Written after placement, so a failed build leaves the last publish's folder as it was.
+    server_name = None
     if (action.get("server") or {}).get("emit", True):
-        server_path = Path("projects") / "server" / "abilities" / \
-            f"{action['id'].split('.')[-1]}_{plan['animation']}.sql"
-        if not dry_run:
-            server_path.parent.mkdir(parents=True, exist_ok=True)
-            server_path.write_text(sql + "\n", encoding="utf-8")
+        server_name = f"{folder.name}_{plan['animation']}.sql"
+    warnings = list(plan.get("warnings") or [])
+    if not dry_run:
+        record = AP.publish_record(action["id"], recipe["name"], plan["kind"], plan["animation"],
+                                   placements, server_name)
+        # The DATs are placed and registered by now, so a folder that cannot be written (a
+        # read-only copy, a file in use) is a warning: the build still returns and its result
+        # is recorded, which is what undo and the next build go by.
+        try:
+            AP.write_publish_folder(folder, record, [Path(p["source"]) for p in placements], sql)
+        except (OSError, ValueError) as e:
+            warnings.append(f"publish folder not updated: {e}")
     return {
         "id": action["id"], "type": "ability", "kind": plan["kind"], "animation": plan["animation"],
-        "recipe": str(recipe_path), "placements": placements,
-        "server": str(server_path) if server_path else None, "sql": sql,
+        "name": recipe["name"],
+        "recipe": str(recipe_path), "placements": placements, "folder": str(folder),
+        "server": str(folder / server_name) if server_name else None, "sql": sql,
+        "warnings": warnings,
         "registered": f"animation {plan['animation']} -> {len(placements)} DAT(s)",
     }
+
+
+def _make_room_for_band(root: Path, file_ids: list[int], dry_run: bool) -> None:
+    """A custom band's file ids sit past the end of the expanded tables. The client plugin
+    (cexislots) grows the client's table in memory and merges each XIPivot overlay's
+    ROM pair into it, so the overlay's pair is what has to hold the id: grow the pivot
+    folder's to the band ceiling here. The install's tables are never grown for it —
+    the plugin does not read band registrations from them."""
+    import xi.xi_config as cfg
+    from xi.xi_config import CUSTOM_ROM_IDX
+    floor, ceiling = cfg.fx_band_floor(), cfg.fx_band_ceiling()
+    top = max((f for f in file_ids if floor and floor <= f < ceiling), default=None)
+    if top is None:
+        return
+    ft = root / f"ROM{CUSTOM_ROM_IDX}" / f"FTABLE{CUSTOM_ROM_IDX}.DAT"
+    vt = root / f"ROM{CUSTOM_ROM_IDX}" / f"VTABLE{CUSTOM_ROM_IDX}.DAT"
+    if not (ft.exists() and vt.exists()) or _table_holds(ft, vt, ceiling - 1):
+        return                     # missing tables get their own error; big enough already
+    if _root_target_name(root) != "pivot":
+        if _table_holds(ft, vt, top):
+            return
+        raise click.ClickException(
+            f"file_id {top:,} is in a custom animation band. The client plugin (cexislots) reads "
+            "band registrations from an XIPivot overlay's ROM tables, not the install's, so build "
+            "this into the pivot folder: add --pivot (Use Pivot Folder in the model viewer's Manage "
+            "panel). Or take a number any client loads (--animation N; `xi ability slots` lists them).")
+    have = vt.stat().st_size
+    click.echo(f"  {'would grow' if dry_run else 'growing'} {ft.parent.name} tables in the pivot folder "
+               f"{have:,} -> {ceiling:,} entries for the custom animation bands "
+               "(the install's tables are left alone)")
+    if dry_run:
+        return
+    from xi.ftable.xi_core import forget_tables
+    from xi.ftable.xi_expand import _grow_table_file
+    _backup_once(ft)
+    _backup_once(vt)
+    _grow_table_file(str(ft), ceiling, 2, False)
+    _grow_table_file(str(vt), ceiling, 1, False)
+    forget_tables()
 
 
 def _is_own_previous(action: dict, dat: str) -> bool:
     """True when ``dat`` is a placement this action recorded on an earlier build."""
     prev = (action.get("result") or {}).get("placements") or []
     return any(str(p.get("dat", "")).upper() == dat.upper() for p in prev)
+
+
+# ── Spell / command menu records (a new row of ROM/118/114.DAT + its names) ────
+# The definition (schema/spell_definition.json, command_definition.json) names a
+# retail record to clone and the fields/texts to change; `dats build` decides the
+# id against the live table (ids above the retail band only), writes the record
+# into the enlarged section, the names/help into the d_msg tables, and emits a
+# server row template. Library: xi.menu.xi_menu_table. The client only reads past
+# the retail band with a ceiling plugin such as cexislots (docs/menu/records.md).
+
+RECORD_TYPES = ("spell", "command")
+
+
+def _record_action_from_definition(source: Path, resource_root: Path, kind: str, *,
+                                   action_id: str | None = None, record_id: int | None = None,
+                                   menu_index: int | None = None) -> dict:
+    """Validate a definition, copy it under ``projects/resources/<kind>/`` and return
+    the manifest action for it (shared by `dats prepare` and the `dats new` wizard)."""
+    from xi.menu.xi_menu_table import MenuError, definition_kind, load_definition
+    try:
+        d = load_definition(source)
+    except MenuError as e:
+        raise click.ClickException(str(e))
+    if definition_kind(d) != kind:
+        raise click.ClickException(f"{source}: is a {definition_kind(d)} definition, not {kind}.")
+    action_id = action_id or f"{kind}.{_slug(d['name'])}"
+    dest = resource_root / kind / f"{action_id.removeprefix(kind + '.')}.{kind}.json"
+    if source.resolve() != dest.resolve():
+        _copy_file(source, dest)
+    target: dict = {"id": record_id if record_id is not None else d.get("id", "auto")}
+    if kind == "spell":
+        target["menu_index"] = menu_index if menu_index is not None else d.get("menu_index", "auto")
+    return {
+        "id": action_id, "type": kind,
+        "target": target,
+        "resources": {"definition": _relative_to_resources(dest, resource_root)},
+        "server": {"emit": True},
+    }
+
+
+def _record_result(built: dict | None) -> dict:
+    """The inline ``result`` recorded for a spell / command action."""
+    b = built or {}
+    res = {"record_id": b.get("record_id"), "copy_from": b.get("copy_from"),
+           "dat": b.get("dat"), "strings": b.get("strings") or [], "server": b.get("server")}
+    if b.get("menu_index") is not None:
+        res["menu_index"] = b["menu_index"]
+    if b.get("replaced"):
+        res["replaced"] = b["replaced"]   # a forced overwrite's old row, for undo
+    return res
+
+
+def _next_record_id(kind: str, action: dict, menu) -> int:
+    """Reuse the id previously recorded on this action's ``result`` (stable across
+    rebuilds), else the highest free id above the retail band — top-down, so the
+    ids stay clear of anything retail could ever add below."""
+    from xi.menu.xi_menu_table import MenuError, pick_id
+    prev = (action.get("result") or {}).get("record_id")
+    if isinstance(prev, int):
+        return prev
+    try:
+        return pick_id(kind, menu)
+    except MenuError as e:
+        raise click.ClickException(str(e))
+
+
+def _root_target_name(root: Path) -> str | None:
+    """The build target (`dir` / `pivot` / `hd`) whose folder is ``root``."""
+    for name in ("dir", "pivot", "hd"):
+        try:
+            if _target_root(name).resolve() == Path(root).resolve():
+                return name
+        except click.ClickException:
+            continue
+    return None
+
+
+def _build_record(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
+                  dry_run: bool = False) -> dict:
+    from xi.menu import xi_menu_table as MT
+    kind = action["type"]
+    resources = action.get("resources", {})
+    if not resources.get("definition"):
+        raise click.ClickException(f"{action.get('id')}: {kind} action needs resources.definition.")
+    def_path = _resolve_raw_source(resources["definition"], manifest_path, manifest)
+    try:
+        d = MT.load_definition(def_path)
+    except MT.MenuError as e:
+        raise click.ClickException(str(e))
+    target = action.get("target") or {}
+    prev = action.get("result") or {}
+    prev_id = prev.get("record_id") if isinstance(prev.get("record_id"), int) else None
+    root = _active_build_root()
+    # Only a build into this same folder counts as "ours" here: another target may
+    # hold something else at that id.
+    built_here = _root_target_name(root) in (prev.get("targets") or [])
+    try:
+        menu = MT.load_menu(root)
+    except (OSError, MT.MenuError) as e:
+        raise click.ClickException(f"{action['id']}: cannot read {MT.MENU_DAT} under {root}: {e}")
+    wanted = target.get("id", "auto")
+    record_id = _next_record_id(kind, action, menu) if wanted in (None, "auto") else int(wanted)
+    k = MT.KINDS[kind]
+    if record_id < k.custom_first and not force:
+        raise click.ClickException(
+            f"{action['id']}: {kind} id {record_id} is inside the retail band (< {k.custom_first}); "
+            "a retail update could take it. Pass --force to use it anyway.")
+    if record_id >= k.ceiling:
+        raise click.ClickException(f"{action['id']}: {kind} id {record_id} is past the client ceiling {k.ceiling - 1}.")
+    # The id changed since the last build into this folder: that row goes back to what
+    # it replaced (or empty) instead of being left behind.
+    moved_from = prev_id if prev_id is not None and prev_id != record_id and built_here else None
+    if moved_from is not None:
+        MT.restore_row(kind, menu, moved_from, prev.get("replaced"))
+    own = prev_id == record_id and built_here
+    recs = menu.records(kind)
+    occupied = record_id < len(recs) and not MT.is_empty(recs[record_id]) and not own
+    if occupied and not force:
+        raise click.ClickException(
+            f"{action['id']}: {kind} id {record_id} already holds a record. Pass --force to overwrite it.")
+    mi = target.get("menu_index", "auto") if kind == "spell" else None
+    menu_index = None if mi in (None, "auto") else int(mi)
+    if menu_index is None and kind == "spell" and prev_id == record_id:
+        # A rebuild keeps the slot it took (else "next free" would count its own record).
+        if isinstance(prev.get("menu_index"), int):
+            menu_index = prev["menu_index"]
+    try:
+        # What a forced overwrite replaces is kept on the result so undo can put it back.
+        replaced = prev.get("replaced") if own else MT.capture_record(kind, root, record_id, menu)
+        rec = MT.build_record(kind, menu, d, record_id, menu_index)
+        fields = MT.read_fields(kind, rec)
+        menu.set_record(kind, record_id, rec)
+        # Every name / help table is checked before anything is written, so text that
+        # does not fit leaves 114.DAT and the string tables as they were.
+        MT.set_texts(kind, root, record_id, d["text"], dry_run=True)
+        dat_path = MT.save_menu(root, menu, dry_run=dry_run)
+        if moved_from is not None:
+            MT.restore_texts(kind, root, moved_from, prev.get("replaced"), dry_run=dry_run)
+        MT.set_texts(kind, root, record_id, d["text"], dry_run=dry_run)
+    except MT.MenuError as e:
+        raise click.ClickException(f"{action['id']}: {e}")
+
+    sql = MT.server_snippet(kind, d, record_id, d["copy_from"])
+    server_path = None
+    if (action.get("server") or {}).get("emit", True):
+        server_path = Path("projects") / "server" / f"{kind}s" / f"{action['id'].split('.')[-1]}_{record_id}.sql"
+        if not dry_run:
+            server_path.parent.mkdir(parents=True, exist_ok=True)
+            server_path.write_text(sql + "\n", encoding="utf-8")
+    return {
+        "id": action["id"], "type": kind, "record_id": record_id, "copy_from": d["copy_from"],
+        "name": d["text"]["name_en"], "menu_index": fields.get("menu_index"),
+        "dat": MT.MENU_DAT, "output": str(dat_path), "strings": MT.string_tables(kind),
+        "replaced": replaced, "moved_from": moved_from,
+        "server": str(server_path) if server_path else None, "sql": sql,
+        "warning": MT.client_warning(kind, record_id),
+        "registered": f"{kind} {record_id} ({d['text']['name_en']}) <- cloned from {d['copy_from']}",
+    }
+
+
+def _wizard_record(kind: str, slug: str, prev: dict | None, manifest_path: Path, manifest: dict) -> dict:
+    from xi.menu.xi_menu_table import KINDS, client_warning, load_definition, MenuError
+    p = prev or {}
+    resource_root = _resource_root(manifest_path, manifest)
+    found = sorted(Path("exports").glob(f"**/*.{kind}.json")) if Path("exports").is_dir() else []
+    click.echo(f"\n>> Which definition? (a .{kind}.json — see schema/{kind}_definition.json; "
+               f"`copy_from` names the retail {kind} to clone)")
+    if found:
+        click.echo("   Found:")
+        for i, f in enumerate(found[:20], 1):
+            click.echo(f"     {i}. {f}")
+        click.echo("   Enter a number, or type a path.")
+    click.echo()
+    default = (p.get("resources") or {}).get("definition")
+    if default:
+        default = str(resource_root / default)
+    while True:
+        raw = click.prompt("Enter definition", default=default or "", show_default=bool(default)).strip().strip('"')
+        if raw.isdigit() and found and 1 <= int(raw) <= len(found[:20]):
+            src = found[int(raw) - 1]
+        else:
+            src = Path(raw)
+        if not src.is_file():
+            click.echo(f"   ✗ not a file: {src}")
+            continue
+        try:
+            load_definition(src)
+            break
+        except MenuError as e:
+            click.echo(f"   ✗ {e}")
+    k = KINDS[kind]
+    prev_id = (p.get("target") or {}).get("id", "auto")
+    click.echo(f"\n>> Which {kind} id? (auto = the highest free id above the retail band "
+               f"{k.custom_first}..{k.ceiling - 1}; ids below need --force)")
+    click.echo(click.style(f"   ⚠ {client_warning(kind)}", fg="yellow"))
+    click.echo()
+    while True:
+        raw = click.prompt("Enter id or auto", default=str(prev_id)).strip().lower()
+        if raw in ("", "auto"):
+            record_id = None
+            break
+        if raw.isdigit() and int(raw) < k.ceiling:
+            record_id = int(raw)
+            break
+        click.echo(f"   ✗ enter auto or a number 0..{k.ceiling - 1}")
+    action = _record_action_from_definition(src, resource_root, kind, action_id=f"{kind}.{slug}",
+                                            record_id=record_id)
+    if p.get("result"):
+        action["result"] = p["result"]   # keep the id a previous build landed on
+    return action
+
+
+_DB_LABELS = {
+    "armor": "Armor", "weapons": "Weapons", "general": "General items", "usable": "Consumables",
+    "puppet": "Automaton", "maze": "Maze Mongers", "monst1": "Monstrosity instincts",
+    "items7": "Items 7 (retail, Sept 2026)", "roeObj": "RoE objectives", "items6": "Commands",
+    "gil": "Currency", "keyitems": "Key items", "titles": "Titles", "spells": "Spell names",
+    "spellHelp": "Spell help", "abilities": "Ability names", "abilityHelp": "Ability help",
+    "spellData": "Spell data (MP, cast, recast, levels)", "abilityData": "Ability data (TP, level, range)",
+}
+_MASK_FIELDS = ("flags", "jobs", "races", "slots")
+
+
+def _wizard_change(edit: dict, table: str, raw: str) -> None:
+    """Apply one wizard line to ``edit``: ``field=value``, ``jp.field=value``,
+    ``field~old=>new`` (replace part of a text), ``mod.NAME=value`` (empty removes it)."""
+    from xi.database import xi_core as C
+    item = table in C.ITEM_LAYOUT
+    if "~" in raw.split("=", 1)[0]:
+        key, rest = raw.split("~", 1)
+        if "=>" not in rest:
+            raise ValueError("write a replace as field~old=>new")
+        old, new = rest.split("=>", 1)
+        lang, key = ("jp", key[3:]) if key.startswith("jp.") else ("en", key)
+        spec = edit.setdefault("strings", {}).setdefault(lang, {})
+        cur = spec.get(key.strip())
+        rep = cur["replace"] if isinstance(cur, dict) else {}
+        spec[key.strip()] = {"replace": {**rep, old.strip(): new.strip().replace("\\n", "\n")}}
+        return
+    if "=" not in raw:
+        raise ValueError("write field=value")
+    key, value = (s.strip() for s in raw.split("=", 1))
+    if key.startswith("mod."):
+        if not item:
+            raise ValueError("mods are for item tables")
+        mods = edit.setdefault("server", {}).setdefault("item_mods", {})
+        mods[key[4:].upper()] = int(value) if value else None
+        return
+    if key == "note":
+        edit["note"] = value
+        return
+    if table in C.MENU_KINDS:
+        # A spell / command record: its fields (mp=5, element=light) and levels.WHM=1
+        # (levels.WHM= : the job can't learn it).
+        values = edit.setdefault("set", {})
+        if key.startswith("levels."):
+            values.setdefault("levels", {})[key[7:].upper()] = int(value) if value else None
+        elif key in C.menu_fields(table):
+            values[key] = int(value) if value.lstrip("-").isdigit() else value.lower()
+        else:
+            raise ValueError(f"{table} has no {key!r} — it has {', '.join(C.menu_fields(table))} "
+                             "(levels as levels.WHM=1)")
+        return
+    lang, name = ("jp", key[3:]) if key.startswith("jp.") else ("en", key)
+    if item and name in C.set_fields(table) and lang == "en":
+        if name in _MASK_FIELDS:
+            names = [v.strip().upper() for v in re.split(r"[,\s]+", value) if v.strip()]
+            edit.setdefault("set", {})[name] = "all" if names == ["ALL"] and name in ("jobs", "races") else names
+        elif name == "skill":
+            edit.setdefault("set", {})[name] = int(value) if value.isdigit() else value.upper()
+        else:
+            edit.setdefault("set", {})[name] = int(value)
+        return
+    if name in C.string_names(table, lang):
+        numeric = name in ("article", "category", "keyItem")
+        edit.setdefault("strings", {}).setdefault(lang, {})[name] = (
+            int(value) if numeric else value.replace("\\n", "\n"))
+        return
+    fields = (C.set_fields(table) if item else []) + C.string_names(table, "en")
+    raise ValueError(f"{table} has no {key!r} — it has {', '.join(fields)}")
+
+
+def _wizard_database(slug: str, prev: dict | None, pivot: bool) -> dict:
+    """`dats new` for record edits: pick a table and an id, see what the record holds,
+    then give the changes as field=value lines. Edits go into database.<slug>."""
+    from xi.database import xi_build as DB
+    from xi.database import xi_core as C
+    root = _target_root("pivot" if pivot else "dir")
+    action = dict(prev) if prev else {"id": f"database.{slug}", "type": "database", "edits": []}
+    edits = list(action.get("edits") or [])
+    tables = C.tables()
+    labels = [f"{_DB_LABELS.get(t, t)} ({t})" for t in tables]
+    while True:
+        table = tables[labels.index(_choose("Which table?", labels, default=labels[0]))]
+        rid = _ask("Record id? (the item id for items)", type=int)
+        at = next((i for i, e in enumerate(edits) if e.get("table") == table and e.get("id") == rid), None)
+        edit = dict(edits[at]) if at is not None else {"table": table, "id": rid}
+        try:
+            cur = DB.describe(root, table, rid)
+        except DB.DbError as e:
+            click.echo(click.style(f"  {e}", fg="yellow"))
+            continue
+        if cur["empty"] and (DB.is_item_table(table) or table in C.MENU_KINDS):
+            click.echo(f"\n  {table} {rid} is an empty slot ({cur['dat']}).")
+            if "copy_from" not in edit:
+                edit["copy_from"] = _ask("Copy which record into it? (an id of the same table)", type=int)
+        else:
+            click.echo(f"\n  {table} {rid}: {cur['name']!r}  ({cur['dat']}, {cur.get('format', 'd_msg')})")
+            for k, v in cur["fields"].items():
+                click.echo(f"    {k:<14} {v}")
+            for k, v in cur["strings"].items():
+                click.echo(f"    {k:<14} {_short(v, 90)}")
+        click.echo("\n  Changes, one per line (blank when done):  level=50   jobs=WAR,PLD   flags=RARE,EX\n"
+                   "    description=New text\\nSecond line   description~HP+15=>HP+30   jp.name=…\n"
+                   "    mod.HP=30 (the proposed SQL; mod.HP= removes it)   note=why\n"
+                   "    spell / ability data: mp=5   cast=8 (quarter seconds)   element=light   levels.RDM=3")
+        while True:
+            raw = click.prompt("  change", default="", show_default=False).strip()
+            if not raw:
+                break
+            try:
+                _wizard_change(edit, table, raw)
+            except ValueError as e:
+                click.echo(click.style(f"  {e}", fg="yellow"))
+        errs = C.validate_action({"id": action["id"], "type": "database", "edits": [edit]})
+        if errs:
+            for e in errs:
+                click.echo(click.style(f"  ⚠ {e}", fg="yellow"))
+            if not click.confirm("  Keep this record's edit anyway?", default=False):
+                continue
+        if at is not None:
+            edits[at] = edit
+        else:
+            edits.append(edit)
+        if not click.confirm("\n>> Edit another record?", default=False):
+            break
+    action["edits"] = edits
+    return action
+
+
+def _wizard_zone_dialog(slug: str, prev: dict | None, pivot: bool) -> dict:
+    """`dats new` for a zone's dialog lines: the zone, then line by line — see the line,
+    type its new text (or old=>new to change part of it). `new` adds a line at the end."""
+    from xi.dialog import xi_zone_dialog as ZD
+    root = _target_root("pivot" if pivot else "dir")
+    action = dict(prev) if prev else {"id": f"zone_dialog.{slug}", "type": "zone_dialog", "lines": []}
+    zone = _ask("Which zone? (the zone id — xi zone search <name>)", type=int, default=action.get("zone"))
+    if zone != action.get("zone"):
+        action["lines"] = []
+    action["zone"] = zone
+    lines = list(action.get("lines") or [])
+    try:
+        info = ZD.describe(root, zone, 0)
+    except ZD.ZoneDialogError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"\n  zone {zone}: {info['dat']}, {info['count']} lines  (xi event dialogue search to find one)")
+    while True:
+        raw = click.prompt("\n  Line id (or 'new' to add one at the end)", default="new")
+        if raw.strip().lower() == "new":
+            taken = [l["id"] for l in lines if l.get("new")]
+            lid = max([info["count"] - 1, *taken]) + 1
+            line = {"id": lid, "new": True}
+            click.echo(f"  new line {lid}")
+        else:
+            lid = int(raw)
+            at = next((i for i, l in enumerate(lines) if l.get("id") == lid), None)
+            line = dict(lines[at]) if at is not None else {"id": lid}
+            cur = ZD.describe(root, zone, lid)
+            if cur["en"] is None:
+                click.echo(click.style(f"  zone {zone} has no line {lid} ({cur['count']} lines)", fg="yellow"))
+                continue
+            click.echo(f"  en: {cur['en']!r}")
+            if cur.get("jp") is not None:
+                click.echo(f"  jp: {cur['jp']!r}")
+        click.echo("  Text: \\n new line in the box, \\v wait for a key, {player} {npc} …; old=>new changes part")
+        for lang in ("en", "jp"):
+            if lang == "jp" and line.get("new"):
+                hint = " (blank: the English text)"
+            else:
+                hint = " (blank: leave it)"
+            text = click.prompt(f"  {lang}{hint}", default="", show_default=False)
+            if not text:
+                continue
+            if "=>" in text and not line.get("new"):
+                old, new = text.split("=>", 1)
+                line[lang] = {"replace": {old.strip(): new.strip()}}
+            else:
+                line[lang] = text
+        errs = ZD.validate_action({"id": action["id"], "type": "zone_dialog", "zone": zone, "lines": [line]})
+        if errs:
+            for e in errs:
+                click.echo(click.style(f"  ⚠ {e}", fg="yellow"))
+        else:
+            at = next((i for i, l in enumerate(lines) if l.get("id") == line["id"]), None)
+            if at is None:
+                lines.append(line)
+            else:
+                lines[at] = line
+        if not click.confirm("\n>> Another line?", default=False):
+            break
+    action["lines"] = lines
+    return action
+
+
+def _wizard_zone_npcs(slug: str, prev: dict | None, pivot: bool) -> dict:
+    """`dats new` for a zone's NPC list: the zone, then rename an NPC by its id or add one
+    (`new`) — its name, model and status; the id comes from the custom band."""
+    from xi.entity import xi_custom_npc as CN
+    from xi.entity import xi_zone_npcs as ZN
+    root = _target_root("pivot" if pivot else "dir")
+    action = dict(prev) if prev else {"id": f"zone_npcs.{slug}", "type": "zone_npcs", "npcs": []}
+    zone = _ask("Which zone? (the zone id — xi zone search <name>)", type=int, default=action.get("zone"))
+    if zone != action.get("zone"):
+        action["npcs"] = []
+    action["zone"] = zone
+    npcs = list(action.get("npcs") or [])
+    try:
+        info = ZN.describe(root, zone)
+    except ZN.ZoneNpcsError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"\n  zone {zone}: {info['dat']}, {len(info['names'])} NPC names; "
+               f"next free custom id {info['free']:#x}")
+    names = dict((local, n) for n, local in info["names"])
+    while True:
+        raw = click.prompt("\n  NPC id to rename (hex like 0x2A or decimal), or 'new'", default="new").strip()
+        if raw.lower() == "new":
+            taken = {n["id"] for n in npcs if isinstance(n.get("id"), int)}
+            local = info["free"]
+            while local in taken or local in names:
+                local += 1
+            name = click.prompt("  name")
+            model = click.prompt("  model id (a placed entity model — xi model json --free)", type=int)
+            status = click.prompt("  status (0 normal, 2 hidden, 3 invisible, 6 cutscene only)", type=int,
+                                  default=CN.NPC_STATUS_CUTSCENE_ONLY)
+            server = {"model": model, "status": status}
+            if status != CN.NPC_STATUS_CUTSCENE_ONLY:
+                pos = click.prompt("  position x y z", default="0 0 0")
+                server["pos"] = [float(v) for v in pos.split()[:3]]
+                server["rot"] = click.prompt("  rotation (0-255)", type=int, default=0)
+            npc = {"id": local, "new": True, "name": name, "server": server}
+            click.echo(f"  new NPC {local:#x} ({CN.make_npcid(zone, local):#010x})")
+        else:
+            local = int(raw, 0)
+            if local not in names:
+                click.echo(click.style(f"  zone {zone} has no NPC {local:#x}", fg="yellow"))
+                continue
+            click.echo(f"  {local:#x}: {names[local]!r}")
+            name = click.prompt("  new name", default=names[local])
+            npc = {"id": local, "name": name}
+        errs = ZN.validate_action({"id": action["id"], "type": "zone_npcs", "zone": zone, "npcs": [npc]})
+        if errs:
+            for e in errs:
+                click.echo(click.style(f"  ⚠ {e}", fg="yellow"))
+        else:
+            at = next((i for i, n in enumerate(npcs) if n.get("id") == npc["id"]), None)
+            if at is None:
+                npcs.append(npc)
+            else:
+                npcs[at] = npc
+        if not click.confirm("\n>> Another NPC?", default=False):
+            break
+    action["npcs"] = npcs
+    return action
+
+
+def _wizard_zone_events(slug: str, prev: dict | None, pivot: bool) -> dict:
+    """`dats new` for a zone's events: the zone, then a cutscene file (xi.cutscene.v1, from
+    the zone editor or `xi event decompile`) or a plain dialogue on an NPC."""
+    from xi.event import xi_cutscene_publish as CP
+    from xi.event import xi_zone_events as ZE
+    root = _target_root("pivot" if pivot else "dir")
+    action = dict(prev) if prev else {"id": f"zone_events.{slug}", "type": "zone_events", "events": []}
+    zone = _ask("Which zone? (the zone id — xi zone search <name>)", type=int, default=action.get("zone"))
+    if zone != action.get("zone"):
+        action["events"] = []
+    action["zone"] = zone
+    events = list(action.get("events") or [])
+    try:
+        info = ZE.describe(root, zone)
+    except ZE.ZoneEventsError as e:
+        raise click.ClickException(str(e))
+    with_events = [a for a in info["actors"] if a[2]]
+    click.echo(f"\n  zone {zone}: {info['dat']}, {len(info['actors'])} blocks, {len(with_events)} NPCs with events")
+    while True:
+        kind = _choose("Add a cutscene or a dialogue?", ["cutscene", "dialogue"], default="cutscene")
+        if kind == "cutscene":
+            path = _prompt_existing_dat("Cutscene file (xi.cutscene.v1 JSON)", "Enter path")
+            ev = {"cutscene": str(path.resolve())}
+            try:
+                cs, _src = ZE.load_cutscene(str(path.resolve()), lambda r: Path(r))
+            except ZE.ZoneEventsError as e:
+                click.echo(click.style(f"  ⚠ {e}", fg="yellow"))
+                continue
+            name = click.prompt("  name (what the build records it by)", default=path.stem)
+            ev["name"] = name
+            if CP.has_camera_track(cs):
+                place = click.prompt("  camera scene DAT (where it goes, like ROM10/490/55.DAT)",
+                                     default=CP.camera_dat_rel(cs) or "")
+                ev["camera"] = place.replace("\\", "/")
+        else:
+            actor = click.prompt("  NPC entity id (0x01… — xi event dialogue actors <zone>)")
+            lines = []
+            click.echo("  lines (an empty one ends):")
+            while True:
+                ln = click.prompt("   ", default="", show_default=False)
+                if not ln:
+                    break
+                lines.append(ln)
+            name = click.prompt("  name (what the build records it by)")
+            ev = {"name": name, "dialogue": {"actor": actor, "lines": lines,
+                                              "paged": click.confirm("  one paged box?", default=False)}}
+        errs = ZE.validate_action({"id": action["id"], "type": "zone_events", "zone": zone, "events": [ev]})
+        if errs:
+            for e in errs:
+                click.echo(click.style(f"  ⚠ {e}", fg="yellow"))
+        else:
+            at = next((i for i, e in enumerate(events) if ZE.event_key(e) == ZE.event_key(ev)), None)
+            if at is None:
+                events.append(ev)
+            else:
+                events[at] = ev
+        if not click.confirm("\n>> Another event?", default=False):
+            break
+    action["events"] = events
+    return action
+
+
+def _mix_files(folder: Path) -> list[Path]:
+    """Mix files in ``folder`` and one level down: ``*.mix.json`` and the legacy
+    ``*.recipe.json``, the ``.mix.json`` winning when both exist for one name."""
+    if not folder.is_dir():
+        return []
+    found: dict = {}
+    for pattern in ("*.recipe.json", "*/*.recipe.json", "*.mix.json", "*/*.mix.json"):
+        for p in folder.glob(pattern):
+            stem = p.name[:-len(".mix.json")] if p.name.endswith(".mix.json") else p.name[:-len(".recipe.json")]
+            found[(p.parent, stem.lower())] = p       # .mix.json globbed last, so it wins
+    return sorted(found.values())
 
 
 def _wizard_ability(slug: str, prev: dict | None, manifest_path: Path, manifest: dict) -> dict:
@@ -1012,10 +1778,10 @@ def _wizard_ability(slug: str, prev: dict | None, manifest_path: Path, manifest:
     from xi.ability.xi_publish import KINDS, infer_kind
     p = prev or {}
     resource_root = _resource_root(manifest_path, manifest)
-    # Recipes the mixer and `xi ability recipe --out` leave under exports/ability.
-    found = sorted({*Path("exports/ability").glob("*.recipe.json"),
-                    *Path("exports/ability").glob("*/*.recipe.json")}) if Path("exports/ability").is_dir() else []
-    click.echo("\n>> Which recipe? (a .recipe.json from the Ability Mixer or `xi ability recipe --out`)")
+    # Mix files the mixer and `xi ability recipe --out` leave under exports/ability.
+    found = _mix_files(Path("exports/ability"))
+    click.echo("\n>> Which mix? (a .mix.json — formerly .recipe.json — from the Ability Mixer "
+               "or `xi ability recipe --out`)")
     if found:
         click.echo("   Found:")
         for i, f in enumerate(found[:20], 1):
@@ -1056,10 +1822,17 @@ def _wizard_ability(slug: str, prev: dict | None, manifest_path: Path, manifest:
     anim_raw = _ask("Animation number (the server row's `animation`; auto = the next free one)",
                     "Enter number or auto", default=str(prev_anim)).strip().lower()
     animation = None if anim_raw in ("", "auto") else int(anim_raw)
+    animation_from = None
+    if animation is None:
+        prev_from = (p.get("target") or {}).get("animation_from")
+        from_raw = _ask("Start auto at (the first free number at or above it; any = the first free of all)",
+                        "Enter number or any", default=str(prev_from if prev_from is not None else "any")).strip().lower()
+        animation_from = None if from_raw in ("", "any") else int(from_raw)
     subdir = _ask("ROM10 folder to place the DAT(s) in", "Enter folder number", type=int,
                   default=int((p.get("target") or {}).get("subdir", ABILITY_DEFAULT_SUBDIR)))
     action = _ability_action_from_recipe(src, resource_root, action_id=f"ability.{slug}",
-                                         kind=kind, animation=animation, subdir=subdir)
+                                         kind=kind, animation=animation, subdir=subdir,
+                                         animation_from=animation_from)
     if p.get("result"):
         action["result"] = p["result"]   # keep the slot a previous build landed on
     return action
@@ -1149,6 +1922,285 @@ def _build_gear(action: dict, manifest_path: Path, manifest: dict, force: bool =
             "races": placed_races}
 
 
+# ── database: edits to the client's record tables (xi.database) ─────────────────
+
+def _action_file(action: dict, manifest_path: Path, manifest: dict) -> Path:
+    """The file an action is written in: its include file, else the project file."""
+    owner = ((manifest.get(LAYOUT_KEY) or {}).get("owners") or {}).get(action.get("id"))
+    return Path(owner) if owner else manifest_path
+
+
+def _build_database(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
+                    dry_run: bool = False) -> dict:
+    from xi.database import xi_build as DB
+    root = _active_build_root()
+    action_file = _action_file(action, manifest_path, manifest)
+    sql_path = DB.sql_path(action, action_file, manifest_path)
+    try:
+        return DB.build(action, root=root, target=_root_target_name(root) or "dir", manifest=manifest,
+                        sql_path=sql_path, project=manifest.get("name") or manifest_path.stem,
+                        dry_run=dry_run, base_dir=Path(action_file).parent)
+    except DB.DbError as e:
+        raise click.ClickException(f"{action.get('id')}: {e}")
+
+
+def _build_zone_dialog(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
+                       dry_run: bool = False) -> dict:
+    from xi.dialog import xi_zone_dialog as ZD
+    root = _active_build_root()
+    try:
+        return ZD.build(action, root=root, target=_root_target_name(root) or "dir", dry_run=dry_run)
+    except ZD.ZoneDialogError as e:
+        raise click.ClickException(f"{action.get('id')}: {e}")
+
+
+def _build_zone_npcs(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
+                     dry_run: bool = False) -> dict:
+    from xi.database import xi_build as DB
+    from xi.entity import xi_zone_npcs as ZN
+    root = _active_build_root()
+    sql_path = DB.sql_path(action, _action_file(action, manifest_path, manifest), manifest_path)
+    try:
+        return ZN.build(action, root=root, target=_root_target_name(root) or "dir", manifest=manifest,
+                        sql_path=sql_path, project=manifest.get("name") or manifest_path.stem,
+                        dry_run=dry_run)
+    except ZN.ZoneNpcsError as e:
+        raise click.ClickException(f"{action.get('id')}: {e}")
+
+
+def _lua_path(action: dict, action_file: Path, project_file: Path) -> Path | None:
+    """Where the action's proposed Lua goes: ``server.lua`` relative to the file holding the
+    action, else ``<project>.lua`` beside the project file. None when ``server.emit`` is false."""
+    server = action.get("server") or {}
+    if not server.get("emit", True):
+        return None
+    if server.get("lua"):
+        return Path(action_file).parent / server["lua"]
+    return Path(project_file).with_suffix(".lua")
+
+
+_LUA_HEAD = ("-- Proposed by `xi dats build {project}`. xi-tools never runs this file: each section is the\n"
+             "-- server script that starts an event; paste it into the NPC's script under scripts/zones.\n")
+
+
+def _build_zone_events(action: dict, manifest_path: Path, manifest: dict, force: bool = False,
+                       dry_run: bool = False, apply: bool = False) -> dict:
+    """Compile the action's events into the zone (xi.event.xi_zone_events), place each camera
+    scene DAT like any DAT an action places, and write the server's part beside the project."""
+    from xi.database import xi_build as DB
+    from xi.event import xi_zone_events as ZE
+    root = _active_build_root()
+    target = _root_target_name(root) or "dir"
+    action_file = _action_file(action, manifest_path, manifest)
+    project = manifest.get("name") or manifest_path.stem
+
+    def resolve(ref: str) -> Path:
+        p = Path(ref)
+        if p.is_absolute():
+            if p.is_file():
+                return p
+            raise ZE.ZoneEventsError(f"{ref}: no such file")
+        for base in (action_file.parent, _resource_root(manifest_path, manifest), manifest_path.parent, Path.cwd()):
+            if (base / p).is_file():
+                return base / p
+        raise ZE.ZoneEventsError(f"{ref}: not found beside {action_file.name}, under the project's "
+                                 "resources or here")
+
+    try:
+        built = ZE.build(action, root=root, target=target, resolve=resolve, manifest=manifest, project=project,
+                         force=force, dry_run=dry_run, unwound=not apply)
+    except ZE.ZoneEventsError as e:
+        raise click.ClickException(f"{action.get('id')}: {e}")
+    # Each camera scene DAT is placed and registered like a verbatim DAT; one a previous build
+    # placed that this one no longer does comes out again.
+    placed = []
+    for cam in built["cameras"]:
+        rom = _parse_rom_placement(_rom_rel(cam["dat"]))[0]
+        if rom != 1 and not all((root / f"ROM{rom}" / f"{t}TABLE{rom}.DAT").is_file() for t in "FV"):
+            # What the build's registration would stop on, said by a dry run too.
+            raise click.ClickException(
+                f"{action['id']}: {root} has no ROM{rom} tables, so camera scene {cam['file_id']} "
+                f"({cam['dat']}) can't be registered there. Run `xi ftable expand` on it, or place "
+                "the camera under a ROM that has them.")
+        placed.append(_place_raw_dat_in_build(None, cam["dat"], cam["file_id"], force=force,
+                                              action_id=action["id"], dry_run=dry_run, data=cam.pop("data")))
+    now = {(c["file_id"], _rom_rel(c["dat"]).upper()) for c in built["cameras"]}
+    dropped = []
+    for rec in (((action.get("result") or {}).get("roots") or {}).get(target)) or []:
+        cam = rec.get("camera")
+        if isinstance(cam, dict) and (cam["file_id"], _rom_rel(cam["dat"]).upper()) not in now:
+            dropped.append(cam)
+            if not dry_run:
+                p = root / Path(*_rom_rel(cam["dat"]).split("/"))
+                if p.is_file() and p.read_bytes()[:4] == b"evte":
+                    p.unlink()
+                _unregister_file_id(root, cam["file_id"], _parse_rom_placement(_rom_rel(cam["dat"]))[0])
+    built["placements"], built["dropped"] = placed, dropped
+    sql_path = DB.sql_path(action, action_file, manifest_path)
+    lua_path = _lua_path(action, action_file, manifest_path)
+    if not dry_run:
+        for path, text, head in ((sql_path, built["sql"], None), (lua_path, built["lua"], _LUA_HEAD)):
+            if path is None:
+                continue
+            if text:
+                DB.write_sql_section(path, action["id"], text, project, head=head)
+            else:
+                DB.remove_sql_section(path, action["id"])
+    built["server"] = str(sql_path) if built["sql"] and sql_path is not None else None
+    built["lua_file"] = str(lua_path) if built["lua"] and lua_path is not None else None
+    return built
+
+
+def _zone_list_action_from_source(kind: str, key: str, source: Path, data, action_id: str | None,
+                                  manifest_path: Path, manifest: dict, merge: bool, zone: int | None) -> dict:
+    """A zone_dialog / zone_npcs action from a source: a whole action, ``{"zone", key}``, or a
+    bare list with --zone. With ``merge`` its entries go into the project's action of the same
+    id, replacing an entry of the same id (an "auto" NPC: of the same name)."""
+    if kind == "zone_dialog":
+        from xi.dialog.xi_zone_dialog import validate_action
+    else:
+        from xi.entity.xi_zone_npcs import validate_action
+    body = {key: data} if isinstance(data, list) else \
+        {k: v for k, v in data.items() if k not in ("schema", "$schema", "result")}
+    if zone is not None:
+        body["zone"] = zone
+    if not isinstance(body.get(key), list) or not isinstance(body.get("zone"), int):
+        raise click.ClickException(f"{source}: a {kind} source is an action, {{\"zone\", \"{key}\"}}, "
+                                   f"or a list of {key} with --zone.")
+    action_id = action_id or body.get("id") or f"{kind}.{_slug(source.stem)}"
+    action = {"id": action_id, "type": kind, **{k: v for k, v in body.items() if k not in ("id", "type")}}
+    existing = next((a for a in manifest.get("actions", []) if a.get("id") == action_id), None)
+    if merge and existing:
+        def ident(e):
+            return ("name", e.get("name")) if e.get("id") == "auto" else ("id", e.get("id"))
+        items = list(existing.get(key) or [])
+        at = {ident(e): i for i, e in enumerate(items)}
+        for e in action[key]:
+            if ident(e) in at:
+                items[at[ident(e)]] = e
+            else:
+                items.append(e)
+        action = {**existing, **{k: v for k, v in action.items() if k != key}, key: items}
+    errs = validate_action(action)
+    if errs:
+        raise click.ClickException(f"{source}:\n  " + "\n  ".join(errs))
+    return action
+
+
+def _zone_events_action_from_source(source: Path, data, action_id: str | None, manifest_path: Path,
+                                    manifest: dict, merge: bool, zone: int | None, camera: str | None,
+                                    event_name: str | None) -> tuple[dict, bool]:
+    """A zone_events action from a source: a whole action or ``{"zone", "events"}`` (its
+    cutscene paths are taken relative to the source), or one cutscene file, which becomes an
+    event of the zone's action (``zone_events.<zone>``), replacing one of the same name.
+    Returns ``(action, merge)``."""
+    from xi.event import xi_zone_events as ZE
+
+    def ref(path: str) -> str:
+        # A cutscene the project names: relative to its resources when it lives there, else absolute.
+        p = Path(path)
+        p = p if p.is_absolute() else (source.parent / p)
+        return _relative_to_resources(p, _resource_root(manifest_path, manifest)) if p.exists() else path
+
+    if data.get("schema") in ZE.SCHEMAS:
+        z = zone if zone is not None else data.get("zone")
+        if not isinstance(z, int):
+            raise click.ClickException(f"{source}: the cutscene has no zone field; pass --zone")
+        ev = {"name": event_name or source.stem, "cutscene": ref(str(source.resolve()))}
+        if camera:
+            ev["camera"] = _rom_rel(camera)
+        if data.get("eventId") not in (None, "auto"):
+            ev["eventId"] = data["eventId"]
+        body, merge = {"zone": z, "events": [ev]}, True
+        action_id = action_id or next((a.get("id") for a in manifest.get("actions", [])
+                                       if a.get("type") == "zone_events" and a.get("zone") == z), None) \
+            or f"zone_events.{_zone_slug(z)}"
+    else:
+        body = {k: v for k, v in data.items() if k not in ("schema", "$schema", "result")}
+        if zone is not None:
+            body["zone"] = zone
+        body["events"] = [({**e, "cutscene": ref(e["cutscene"])} if isinstance(e, dict)
+                           and isinstance(e.get("cutscene"), str) else e) for e in body.get("events") or []]
+        action_id = action_id or body.get("id") or f"zone_events.{_slug(source.stem)}"
+    action = {"id": action_id, "type": "zone_events", **{k: v for k, v in body.items() if k not in ("id", "type")}}
+    existing = next((a for a in manifest.get("actions", []) if a.get("id") == action_id), None)
+    if merge and existing:
+        events = list(existing.get("events") or [])
+        at = {ZE.event_key(e): i for i, e in enumerate(events)}
+        for e in action["events"]:
+            if ZE.event_key(e) in at:
+                events[at[ZE.event_key(e)]] = e
+            else:
+                events.append(e)
+        action = {**existing, **{k: v for k, v in action.items() if k != "events"}, "events": events}
+    errs = ZE.validate_action(action)
+    if errs:
+        raise click.ClickException(f"{source}:\n  " + "\n  ".join(errs))
+    return action, merge
+
+
+def _zone_slug(zone: int) -> str:
+    """A zone's name as an id part (``lower_jeuno``), else ``zone_<id>``."""
+    try:
+        from xi.event.xi_event import zone_name_for
+        name = zone_name_for(zone)
+    except Exception:
+        name = None
+    return _slug(name) if name else f"zone_{zone}"
+
+
+def _database_result(built: dict | None, previous: dict | None, keep: bool = False) -> dict:
+    """The inline ``result`` of a database action: per build target, every record it
+    wrote with each field's value before and after (what --reset and undo take back).
+    ``keep``: the build applied on top of the last one, whose records stay first."""
+    b = built or {}
+    roots = dict((previous or {}).get("roots") or {})
+    target = b.get("target") or "dir"
+    roots[target] = ((roots.get(target) or []) if keep else []) + (b.get("records") or [])
+    out = {"roots": roots, "sql": b.get("server")}
+    if b.get("type") == "zone_events":
+        out["lua"] = b.get("lua_file")
+    return out
+
+
+def _database_action_from_source(source: Path, data, action_id: str | None, manifest: dict,
+                                 merge: bool) -> dict:
+    """A database action from a source file: a whole action, ``{"edits": [...]}`` or a bare
+    list of edits. With ``merge`` its edits go into the project's action of the same id,
+    replacing an edit of the same table and id."""
+    from xi.database.xi_core import validate_action
+    if isinstance(data, list):
+        body: dict = {"edits": data}
+    elif isinstance(data, dict) and isinstance(data.get("edits"), list):
+        body = {k: v for k, v in data.items() if k not in ("schema", "$schema", "result")}
+    else:
+        raise click.ClickException(f"{source}: a database source is a database action, "
+                                   '{"edits": [...]} or a list of edits.')
+    action_id = action_id or body.get("id") or f"database.{_slug(source.stem)}"
+    action = {"id": action_id, "type": "database",
+              **{k: v for k, v in body.items() if k not in ("id", "type")}}
+    existing = next((a for a in manifest.get("actions", []) if a.get("id") == action_id), None)
+    if merge and existing:
+        edits = list(existing.get("edits") or [])
+        at = {(e.get("table"), e.get("id")): i for i, e in enumerate(edits)}
+        for e in action["edits"]:
+            key = (e.get("table"), e.get("id"))
+            if key in at:
+                edits[at[key]] = e
+            else:
+                edits.append(e)
+        action = {**existing, **{k: v for k, v in action.items() if k != "edits"}, "edits": edits}
+    errs = validate_action(action)
+    if errs:
+        raise click.ClickException(f"{source}:\n  " + "\n  ".join(errs))
+    return action
+
+
+def _short(value, width: int = 70) -> str:
+    s = repr(value)
+    return s if len(s) <= width else s[:width - 1] + "…"
+
+
 @click.group("dats")
 def group():
     """Build reproducible DAT package trees from manifest JSON."""
@@ -1159,48 +2211,115 @@ def group():
 @click.argument("manifest", type=click.Path(path_type=Path), default=DEFAULT_MANIFEST, required=False)
 @click.option("--output", "output", type=click.Path(path_type=Path), default=None)
 def json_cmd(manifest: Path, output: Path | None):
-    """Print a normalized dats manifest as JSON."""
-    _dump_json(_read_manifest(manifest), output)
+    """Print a normalized dats manifest as JSON (includes expanded in place)."""
+    data = _read_manifest(manifest)
+    data.pop(LAYOUT_KEY, None)
+    _dump_json(data, output)
 
 
 @group.command("prepare")
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.argument("manifest", type=click.Path(path_type=Path), default=None, required=False)
-@click.option("--project", default=None, help="Manifest name — writes to dats/<project>.json instead of dats/update.json.")
+@click.option("--project", default=None, help="Manifest name — writes to projects/<project>.json instead of projects/update.json.")
 @click.option("--id", "action_id", default=None, help="Stable action id to use in the manifest.")
 @click.option("--type", "action_type", default=None, help="Force the action type instead of inferring it.")
 @click.option("--target", default=None, help="Target ROM DAT path when the source does not contain one.")
-@click.option("--hd/--no-hd", default=True, show_default=True, help="For zone actions, also build dats/ffxi-hd output.")
+@click.option("--hd/--no-hd", default=True, show_default=True, help="For zone actions, also build projects/ffxi-hd output.")
 @click.option("--replace", is_flag=True, help="Replace an existing action with the same id.")
 @click.option("--kind", "ability_kind", type=click.Choice(["auto", "ja", "spell", "ws"]), default=None,
               help="Ability recipes: publish as a job ability, spell or weapon skill (default auto = from the recipe).")
 @click.option("--animation", type=int, default=None,
               help="Ability recipes: the animation number to take (default auto = next free).")
+@click.option("--animation-from", type=int, default=None,
+              help="Ability recipes: where auto starts — the first free number at or above this.")
 @click.option("--subdir", type=int, default=None,
               help=f"Ability recipes: ROM10 folder to place the DAT(s) in (default {ABILITY_DEFAULT_SUBDIR}).")
+@click.option("--record-id", type=int, default=None,
+              help="Spell / command definitions: the record id to take (default auto = highest free above the retail band).")
+@click.option("--menu-index", type=int, default=None,
+              help="Spell definitions: the menu slot to sort into (default auto = next after retail's).")
+@click.option("--merge", is_flag=True, default=False,
+              help="Database edits / zone dialog lines: add them to the project's action of the same id, "
+                   "replacing an edit of the same table and id (or a line of the same id); the rest stay.")
+@click.option("--zone", "zone_id", type=int, default=None,
+              help="Zone dialog lines / zone NPCs / a cutscene: the zone a bare list (or a cutscene with no "
+                   "zone field) belongs to.")
+@click.option("--camera", default=None,
+              help="A cutscene with a camera: where its camera scene DAT goes (like ROM10/490/55.DAT).")
+@click.option("--event-name", default=None,
+              help="A cutscene: the name its event is recorded by (default: the file's name).")
+@click.option("--file-id", type=int, default=None,
+              help="A copy (--type copy) to a ROM DAT path: the file id to register there.")
 def prepare_cmd(source: Path, manifest: Path | None, project: str | None, action_id: str | None, action_type: str | None,
                 target: str | None, hd: bool, replace: bool,
-                ability_kind: str | None = None, animation: int | None = None, subdir: int | None = None):
+                ability_kind: str | None = None, animation: int | None = None, subdir: int | None = None,
+                record_id: int | None = None, menu_index: int | None = None,
+                animation_from: int | None = None, merge: bool = False, zone_id: int | None = None,
+                camera: str | None = None, event_name: str | None = None, file_id: int | None = None):
     """Add an exported/import JSON, zone-changes.json or ability recipe to a dats package.
 
     \b
-    An ability recipe (from `xi ability recipe` or the model viewer's Ability Mixer)
-    becomes an `ability` action — the recipe is copied under projects/resources/ability/
-    and `dats build` composes it, places the DAT(s) in ROM10 and registers the file ids:
-      xi dats prepare exports/ability/mixer/tiger_fury.recipe.json --project tiger_fury --replace
+    An ability recipe — a mix file, *.mix.json (formerly *.recipe.json), from `xi ability
+    recipe` or the model viewer's Ability Mixer — becomes an `ability` action: it is copied
+    to projects/resources/ability/<slug>.mix.json and `dats build` composes it, places the
+    DAT(s) in ROM10 and registers the file ids:
+      xi dats prepare exports/ability/mixer/tiger_fury.mix.json --project tiger_fury --replace
       xi dats build tiger_fury --dry-run
+
+    \b
+    Database edits (schema/database.json) — a database action, {"edits": [...]} or a bare
+    list of edits — become a `database` action; --merge adds them to the one already there:
+      xi dats prepare edits.json --project gear_tweaks --merge
     """
     manifest = _resolve_manifest_path(manifest, project)
     manifest_data = _read_manifest(manifest)
     if project:
         manifest_data["name"] = project
-    kind, data = _detect_source_type(source, action_type)
+    # A copy's source is the file itself (any bytes), not a JSON to read.
+    kind, data = ("copy", {}) if action_type == "copy" else _detect_source_type(source, action_type)
     resource_root = _resource_root(manifest, manifest_data)
 
-    if kind == "ability":
+    if kind == "copy":
+        from xi.dats import xi_copy as CP
+        existing = next((a for a in manifest_data.get("actions", [])
+                         if action_id and a.get("id") == action_id), None)
+        path = (CP.rel_path(target) if target else
+                CP.guess_target(source) or CP.rel_path(((existing or {}).get("target") or {}).get("path")))
+        if path is None:
+            raise click.ClickException(
+                f"{source}: pass --target, the path in the game folder to copy it to "
+                "(like ROM/119/51.DAT or sound9/win/music/data/music067.bgw).")
+        action_id = action_id or f"copy.{_slug(path.rsplit('.', 1)[0])}"
+        action = {"id": action_id, "type": "copy", "target": {"path": path},
+                  "resources": {"file": _file_ref(source, manifest)}}
+        if file_id is not None:
+            action["target"]["file_id"] = file_id
+        errs = CP.validate_action(action)
+        if errs:
+            raise click.ClickException(f"{source}:\n  " + "\n  ".join(errs))
+    elif kind == "ability":
         action = _ability_action_from_recipe(source, resource_root, action_id=action_id,
-                                             kind=ability_kind, animation=animation, subdir=subdir)
+                                             kind=ability_kind, animation=animation, subdir=subdir,
+                                             animation_from=animation_from)
         action_id = action["id"]
+    elif kind in RECORD_TYPES:
+        action = _record_action_from_definition(source, resource_root, kind, action_id=action_id,
+                                                record_id=record_id, menu_index=menu_index)
+        action_id = action["id"]
+    elif kind == "database":
+        action = _database_action_from_source(source, data, action_id, manifest_data, merge)
+        action_id = action["id"]
+        replace = replace or merge
+    elif kind in ("zone_dialog", "zone_npcs"):
+        action = _zone_list_action_from_source(kind, "lines" if kind == "zone_dialog" else "npcs", source, data,
+                                               action_id, manifest, manifest_data, merge, zone_id)
+        action_id = action["id"]
+        replace = replace or merge
+    elif kind == "zone_events":
+        action, merge = _zone_events_action_from_source(source, data, action_id, manifest, manifest_data, merge,
+                                                        zone_id, camera, event_name)
+        action_id = action["id"]
+        replace = replace or merge
     elif kind == "zone":
         dat_target = _rom_rel(target or data.get("zone", ""))
         if not dat_target:
@@ -1224,7 +2343,7 @@ def prepare_cmd(source: Path, manifest: Path | None, project: str | None, action
             action["type"] = kind
             action.pop("op", None)  # `op` is not used — the builder dispatches on `type`
             # Mesh resources (the .glb) stay referenced in-place in exports/ rather
-            # than being copied into dats/resources/, so a re-export is picked up
+            # than being copied into projects/resources/, so a re-export is picked up
             # by the next build without needing to re-`prepare`.
             action["resources"] = _copy_action_resources(data, source, dest_dir, resource_root, copy=kind != "mesh")
             if target:
@@ -1287,8 +2406,20 @@ def prepare_cmd(source: Path, manifest: Path | None, project: str | None, action
         # The recorded allocation (animation number, placements) always survives a
         # re-prepare so a rebuild lands on the same slot; the target block does too
         # unless this run set part of it explicitly.
-        explicit = ability_kind is not None or animation is not None or subdir is not None
+        explicit = (ability_kind is not None or animation is not None or subdir is not None
+                    or animation_from is not None)
         preserve = ("result",) + (() if explicit else ("target", "kind"))
+    elif kind in RECORD_TYPES:
+        # Same rule: the recorded id survives a re-prepare; the target too unless set here.
+        explicit = record_id is not None or menu_index is not None
+        preserve = ("result",) + (() if explicit else ("target",))
+    elif kind in RESTORABLE_TYPES:
+        # What each build changed (the values undo and the next build put back) survives.
+        preserve = ("result",)
+    elif kind == "copy":
+        # Where the last build put the file survives (undo takes it from there); the target
+        # too unless --target or --file-id changed it.
+        preserve = ("result",) + (() if target or file_id is not None else ("target",))
     else:
         preserve = ("model",) + (() if target else ("target",))
     _add_or_replace_action(manifest_data, action, replace, preserve=preserve)
@@ -1307,6 +2438,15 @@ def prepare_cmd(source: Path, manifest: Path | None, project: str | None, action
         fid = _prepare_file_id(saved)
         fid_note = f" -> file_id {fid}" if fid is not None else ""
         click.echo(f"Model ID: {model['model_id']} ({model.get('kind')}){fid_note}")
+    if kind in RECORD_TYPES:
+        # The id the build will take: an explicit target, else the one a build recorded, else auto.
+        from xi.menu.xi_menu_table import client_warning
+        rid = (saved.get("target") or {}).get("id")
+        if not isinstance(rid, int):
+            rid = (saved.get("result") or {}).get("record_id")
+        warning = client_warning(kind, rid if isinstance(rid, int) else None)
+        if warning:
+            click.echo(click.style(f"⚠ {warning}", fg="yellow"))
 
 
 def _result_rows(manifest_data: dict) -> list[tuple[str, ...]]:
@@ -1317,6 +2457,44 @@ def _result_rows(manifest_data: dict) -> list[tuple[str, ...]]:
         aid = action.get("id", "?")
         typ = action.get("type", "?")
         res = action.get("result") or {}
+        if typ == "zone_events":
+            recorded = [(t, e) for t, recs in (res.get("roots") or {}).items() for e in recs]
+            for t, e in recorded:
+                cam = e.get("camera") or {}
+                rows.append((aid, f"{typ} ({t})", e.get("dat") or "-",
+                             f"zone {e.get('zone')} event {e.get('event')} on {e.get('actor')} ({e.get('name')})",
+                             str(cam.get("file_id", "-"))))
+            if not recorded:
+                from xi.event.xi_zone_events import event_key
+                rows += [(aid, typ, "-", f"zone {action.get('zone')} {event_key(ev)}", "-")
+                         for ev in action.get("events") or []]
+            continue
+        if typ in ("database", "zone_dialog", "zone_npcs"):
+            recorded = [(t, e) for t, recs in (res.get("roots") or {}).items() for e in recs]
+            for t, e in recorded:
+                tag = " new" if e.get("created") else ""
+                what = (f"zone {e.get('zone')} line {e.get('id')}" if typ == "zone_dialog" else
+                        f"zone {e.get('zone')} NPC {e.get('local', 0):#x}" if typ == "zone_npcs" else
+                        f"{e.get('table')} {e.get('id')}")
+                lang = f" {e['lang']}" if e.get("lang") else ""
+                rows.append((aid, f"{typ} ({t})", e.get("dat") or "-", f"{what}{lang}{tag}", "-"))
+            if not recorded:
+                todo = ([f"zone {action.get('zone')} line {l.get('id')}" for l in action.get("lines") or []]
+                        if typ == "zone_dialog" else
+                        [f"zone {action.get('zone')} NPC {n.get('id')}" for n in action.get("npcs") or []]
+                        if typ == "zone_npcs" else
+                        [f"{e.get('table')} {e.get('id')}" for e in action.get("edits") or []])
+                rows += [(aid, typ, "-", w, "-") for w in todo]
+            continue
+        if typ in RECORD_TYPES:
+            rid = res.get("record_id", (action.get("target") or {}).get("id", "auto"))
+            rows.append((aid, typ, res.get("dat") or "ROM/118/114.DAT", str(rid), "-"))
+            continue
+        if typ == "copy":
+            fid = res.get("file_id", (action.get("target") or {}).get("file_id"))
+            rows.append((aid, typ, res.get("path") or (action.get("target") or {}).get("path") or "-", "-",
+                         str(fid) if fid is not None else "-"))
+            continue
         if typ in ("gear", "ability"):
             placements = res.get("placements") or []
             model_id = res.get("model_id", (action.get("model") or {}).get("model_id"))
@@ -1342,7 +2520,7 @@ def _result_rows(manifest_data: dict) -> list[tuple[str, ...]]:
 
 @group.command("changelog")
 @click.argument("manifest", type=click.Path(path_type=Path), default=None, required=False)
-@click.option("--project", default=None, help="Manifest name — reads dats/<project>.json instead of dats/update.json.")
+@click.option("--project", default=None, help="Manifest name — reads projects/<project>.json instead of projects/update.json.")
 def changelog_cmd(manifest: Path | None, project: str | None):
     """Show each action's recorded result (model_id -> file_id -> DAT) as a table."""
     manifest = _resolve_manifest_path(manifest, project)
@@ -1362,8 +2540,43 @@ def _action_summary(action: dict) -> str:
     if model_id is not None:
         parts.append(f"model {model_id}")
     line = " - ".join(parts)
+    if action.get("type") == "zone_events":
+        evs = action.get("events") or []
+        from xi.event.xi_zone_events import event_key
+        names = [f"{event_key(e) or '?'}{' (dialogue)' if 'dialogue' in e else ''}" for e in evs[:4]]
+        line += (f" - zone {action.get('zone')}: {len(evs)} event{'s' if len(evs) != 1 else ''} "
+                 f"({', '.join(names)}{' …' if len(evs) > 4 else ''})")
+        return line
+    if action.get("type") == "zone_npcs":
+        npcs = action.get("npcs") or []
+        names = [f"{'+' if n.get('new') else ''}{n.get('name') or n.get('id')}" for n in npcs[:5]]
+        line += (f" - zone {action.get('zone')}: {len(npcs)} NPC{'s' if len(npcs) != 1 else ''} "
+                 f"({', '.join(names)}{' …' if len(npcs) > 5 else ''})")
+        return line
+    if action.get("type") == "zone_dialog":
+        lines = action.get("lines") or []
+        ids = [f"{'+' if l.get('new') else ''}{l.get('id')}" for l in lines[:6]]
+        line += (f" - zone {action.get('zone')}: {len(lines)} line{'s' if len(lines) != 1 else ''} "
+                 f"({', '.join(ids)}{' …' if len(lines) > 6 else ''})")
+        return line
+    if action.get("type") == "database":
+        edits = action.get("edits") or []
+        names = [f"{e.get('table')} {e.get('id')}" for e in edits[:4]]
+        line += f" - {len(edits)} edit{'s' if len(edits) != 1 else ''}: {', '.join(names)}"
+        return line + (" …" if len(edits) > 4 else "")
+    if action.get("type") in RECORD_TYPES:
+        rid = (action.get("result") or {}).get("record_id", (action.get("target") or {}).get("id", "auto"))
+        line += f" - id {rid}: {(action.get('resources') or {}).get('definition', '?')}"
+        return line
+    if action.get("type") == "copy":
+        line += (f": {(action.get('resources') or {}).get('file', '?')} >> "
+                 f"{(action.get('target') or {}).get('path', '?')}")
+        return line
     if action.get("type") == "ability":
         anim = (action.get("target") or {}).get("animation", "auto")
+        start = (action.get("target") or {}).get("animation_from")
+        if anim == "auto" and start is not None:
+            anim = f"auto from {start}"
         placements = (action.get("result") or {}).get("placements") or []
         line += f" - {action.get('kind') or 'auto'} animation {anim}"
         line += f": {(action.get('resources') or {}).get('recipe', '?')}"
@@ -1424,7 +2637,7 @@ def _list_glb_textures(mesh_path: Path) -> list[tuple[str, str, str]]:
 
 @group.command("build")
 @click.argument("manifest", type=click.Path(path_type=Path), default=None, required=False)
-@click.option("--project", default=None, help="Manifest name — builds dats/<project>.json instead of dats/update.json.")
+@click.option("--project", default=None, help="Manifest name — builds projects/<project>.json instead of projects/update.json.")
 @click.option("--only", "only", multiple=True, help="Build only these action ids (repeatable).")
 @click.option("--verbose", is_flag=True, default=False, help="Print options/resource/texture detail under each action.")
 @click.option("--force", is_flag=True, default=False,
@@ -1434,22 +2647,90 @@ def _list_glb_textures(mesh_path: Path) -> list[tuple[str, str, str]]:
                    "without writing any files or patching tables.")
 @click.option("--dry-note/--no-dry-note", default=True, hidden=True,
               help="Print the trailing 'Dry run — nothing written' note (the wizard suppresses it).")
+@click.option("--pivot", is_flag=True, default=False,
+              help="Build into FFXI_PIVOT_DIR instead of the base install (FFXI_DIR).")
+@click.option("--apply-db", is_flag=True, default=False,
+              help="Database Update: after the DATs are placed, update the server row named after each ability "
+                   "(or insert one cloned from --clone-from). With --dry-run: a read-only preview.")
+@click.option("--db-row", type=int, default=None,
+              help="Confirm, once, the existing row the build found by name (its id). Needs --apply-db.")
+@click.option("--clone-from", default=None,
+              help="Override the donor a new row / menu record / Lua stub clones: an id or a server name "
+                   "(fire, fast_blade). Default: the kind's donor — cure (spell), berserk (ja), fast_blade (ws).")
+@click.option("--server-id", type=int, default=None,
+              help="Server id for an insert / a menu record with no row yet (default: the highest blank one).")
+@click.option("--menu-record", is_flag=True, default=False,
+              help="Client Menu Record: place the client spell/command record at the row's id (ROM/118/114.DAT + "
+                   "names). Finds the row with SELECTs only when a server is configured.")
+@click.option("--menu-name", default=None,
+              help="Name the menu shows (default: the mix name, _ as a space). No control characters or line breaks.")
+@click.option("--lua-stub", is_flag=True, default=False,
+              help="Lua Stub: write the server script for a row this mix created into XI_SERVER_DIR/scripts/actions.")
+@click.option("--reset", is_flag=True, default=False,
+              help="Reset the tables the actions being built edit in place (database records, zone dialog, "
+                   "NPC names, events, spell / command records) to the install's untouched copy first: its "
+                   ".base, else the file; with --pivot the pivot folder's copy is replaced by it. Without it a "
+                   "build applies its edits to the tables as they are.")
+@click.option("--list", "build_list", is_flag=True, default=False,
+              help="MANIFEST / --project names a build list (projects/build_list.json when neither is "
+                   "given): build its projects in order. A build list file is built as one without it too. "
+                   "With --reset, every table they edit is reset once, first.")
+@click.option("--fresh", is_flag=True, default=False, hidden=True,
+              help="The tables were just reset (a --list --reset): the result records this build only.")
 def build_cmd(manifest: Path | None, project: str | None, only: tuple[str, ...], verbose: bool,
-              force: bool, dry_run: bool, dry_note: bool = True):
-    """Build a manifest directly into the base install (FFXI_DIR).
+              force: bool, dry_run: bool, dry_note: bool = True, pivot: bool = False,
+              apply_db: bool = False, db_row: int | None = None, clone_from: str | None = None,
+              server_id: int | None = None, menu_record: bool = False, menu_name: str | None = None,
+              lua_stub: bool = False, reset: bool = False, build_list: bool = False, fresh: bool = False):
+    """Build a manifest into the base install (FFXI_DIR), or FFXI_PIVOT_DIR with --pivot.
 
-    DATs are placed and their file_ids registered straight into the base install's
-    tables (which must already exist + be expanded); the tables are backed up once
-    to `<name>.base` before the first patch. (XIPivot can't overlay the root FTABLE,
-    so the base install is the only target where custom gear/entity file_ids resolve.)
+    DATs are placed and their file_ids registered straight into the target's tables
+    (which must already exist + be expanded); in the base install the tables are backed
+    up once to `<name>.base` before the first patch. A base-install build then syncs the
+    custom region of FFXI_PIVOT_DIR's tables so the sizes match; a --pivot build
+    registers in that folder's own tables and skips the sync. Each action records the
+    target it was built into, which `undo`, `package` and `release` follow.
+
+    \b
+    For ability actions, once the DATs are placed (docs/ability/mixer.md):
+      --apply-db     update / insert the server row (xi-tools' .env XI_DB_*)
+      --menu-record  the client menu record at the same id (a blank retail row only)
+      --lua-stub     the server script for a row this mix created (XI_SERVER_DIR)
+    Their outcome never fails the build: each prints a db: / menu: / lua: line.
+
+    \b
+    The table edits (database, zone_dialog, zone_npcs, zone_events):
+      (default)  applied to the tables as they are: what an edit names is written,
+                 replacing whatever is there; a zone_events action replaces its own events
+      --reset    the tables the actions being built edit reset first, to the install's
+                 .base (else its file); with --pivot copied over the pivot folder's
+      --list     MANIFEST is a build list: its projects built in order (--reset:
+                 every table they edit reset once, first). A list file needs no --list.
     """
     import xi.xi_config as cfg
+    from xi.dats import xi_build_list as BL
+    from xi.server import xi_server_pass as SP
+    # A build list: named with --list (projects/build_list.json by default), or a file whose
+    # schema says it is one.
+    list_file = BL.list_path(manifest or project) if build_list else None
+    if list_file is None and BL.is_list(_resolve_manifest_path(manifest, project)):
+        list_file = _resolve_manifest_path(manifest, project)
+    if list_file is not None:
+        if only:
+            raise click.ClickException("A build list builds whole projects; --only doesn't go with it.")
+        return _build_list(list_file, reset=reset, pivot=pivot, dry_run=dry_run,
+                           dry_note=dry_note, force=force, verbose=verbose, apply_db=apply_db, db_row=db_row,
+                           clone_from=clone_from, server_id=server_id, menu_record=menu_record,
+                           menu_name=menu_name, lua_stub=lua_stub)
+    opts = SP.ServerOpts(apply_db=apply_db, db_row=db_row,
+                         clone_from=(clone_from.strip() or None) if isinstance(clone_from, str) else None,
+                         server_id=server_id, menu_record=menu_record, menu_name=menu_name, lua_stub=lua_stub)
 
     manifest = _resolve_manifest_path(manifest, project)
     if not manifest.exists():
         raise click.ClickException(
             f"No manifest at {manifest}. Pass an existing project "
-            f"(e.g. `dats build {manifest.stem}` → dats/{manifest.stem}.json) "
+            f"(e.g. `dats build {manifest.stem}` → projects/{manifest.stem}.json) "
             f"or a path to a manifest .json.")
 
     manifest_data = _read_manifest(manifest)
@@ -1460,11 +2741,28 @@ def build_cmd(manifest: Path | None, project: str | None, only: tuple[str, ...],
     selected = set(only)
     active_actions = [a for a in manifest_data.get("actions", [])
                       if a.get("enabled", True) and (not selected or a.get("id") in selected)]
+    target = "pivot" if pivot else "dir"
+    reset_rels: list[str] = []
+    if reset:
+        # The tables the chosen actions edited, and every other action of the project that
+        # edited one of them: a reset table takes all of its edits away, so they all go again.
+        rels = set(_edited_tables({"actions": active_actions}, target))
+        while True:
+            also = [a for a in manifest_data.get("actions", []) if a.get("enabled", True)
+                    and not any(a is b for b in active_actions)
+                    and set(_edited_tables({"actions": [a]}, target)) & rels]
+            if not also:
+                break
+            active_actions = [a for a in manifest_data.get("actions", [])
+                              if any(a is b for b in active_actions + also)]
+            rels |= {r for a in also for r in _edited_tables({"actions": [a]}, target)}
+        reset_rels = sorted(rels)
+    mode = "fresh" if (fresh or reset) else "apply"
 
     click.echo()
     verb = "Previewing" if dry_run else "Building"
     click.echo(f"{verb}: {manifest_data.get('name', 'DAT')} build")
-    # standard_root (dats/ffxi) and hd_root (dats/ffxi-hd) are only for
+    # standard_root (projects/ffxi) and hd_root (projects/ffxi-hd) are only for
     # zone actions; skip both entirely when the manifest has no zone action.
     zone_actions = [a for a in active_actions if a.get("type") == "zone"]
     if zone_actions:
@@ -1473,19 +2771,31 @@ def build_cmd(manifest: Path | None, project: str | None, only: tuple[str, ...],
         _ensure_rom_tables(standard_root, 10)
         click.echo(f"Copied {len(copied_tables)} f/v tables -> {standard_root}")
 
-    # mesh + the verbatim-placement types write DATs + table patches directly into
-    # the base install (the only target whose root FTABLE the client actually reads).
+    # mesh + the verbatim-placement types write DATs + table patches directly into the
+    # target (the base install, or FFXI_PIVOT_DIR with --pivot); menu records edit its
+    # 114.DAT and string tables. A copy registers nothing, so it needs no tables here.
     pack_actions = [a for a in active_actions
                     if a.get("type") in ("mesh", "entity", "gear", "mount", "ability")]
-    target_roots = [("dir", _target_root("dir"))]
-    if pack_actions:
+    target_roots = [(target, _target_root(target))]
+    if pivot and not target_roots[0][1].is_dir():
+        raise click.ClickException(f"FFXI_PIVOT_DIR does not exist: {target_roots[0][1]}")
+    if any(a.get("type") != "zone" for a in active_actions):
+        from xi.xi_config import CUSTOM_ROM_IDX
         n_with_tables = 0
         for name, root in target_roots:
-            has_tables = _ftable_entries(root / "FTABLE.DAT") > 0
+            # A ROM{n} pair alone registers file_ids (the client honours it over the main
+            # pair, and it is all a pivot folder can register through).
+            main_entries = _ftable_entries(root / "FTABLE.DAT")
+            rom_entries = _ftable_entries(root / f"ROM{CUSTOM_ROM_IDX}" / f"FTABLE{CUSTOM_ROM_IDX}.DAT")
+            has_tables = max(main_entries, rom_entries) > 0
             n_with_tables += has_tables
-            suffix = "" if has_tables else "  (DAT-only — no FTABLE here)"
+            suffix = ""
+            if pack_actions and not has_tables:
+                suffix = "  (DAT-only — no FTABLE here)"
+            elif pack_actions and main_entries == 0:
+                suffix = f"  (ROM{CUSTOM_ROM_IDX} tables only)"
             click.echo(f"Target: {_TARGET_LABELS[name]} -> {root}{suffix}")
-        if n_with_tables == 0:
+        if pack_actions and n_with_tables == 0:
             raise click.ClickException(
                 "None of the chosen targets have an FTABLE to register the file_ids in — "
                 "include a target with tables (pivot or dir).")
@@ -1494,7 +2804,8 @@ def build_cmd(manifest: Path | None, project: str | None, only: tuple[str, ...],
     click.echo(f"Actions: {len(active_actions)}")
     click.echo()
     for i, action in enumerate(active_actions, 1):
-        click.echo(f"{i}. {_action_summary(action)}")
+        also_note = "  (shares a reset table)" if selected and action.get("id") not in selected else ""
+        click.echo(f"{i}. {_action_summary(action)}{also_note}")
         if verbose and action.get("type") == "mesh":
             options = action.get("options") or {}
             click.echo(f"   * Options: {_mesh_options_summary(options)}")
@@ -1522,43 +2833,84 @@ def build_cmd(manifest: Path | None, project: str | None, only: tuple[str, ...],
             return _build_mesh(action, manifest, manifest_data, force=force, dry_run=dry_run)
         if kind == "ability":
             return _build_ability(action, manifest, manifest_data, force=force, dry_run=dry_run)
+        if kind == "copy":
+            return _build_copy(action, manifest, manifest_data, force=force, dry_run=dry_run)
+        if kind in RECORD_TYPES:
+            return _build_record(action, manifest, manifest_data, force=force, dry_run=dry_run)
+        # The restorable types write what their edits name over what is there; a zone_events
+        # action takes its own last events back out first (it replaces them), unless the
+        # tables were just reset.
+        if kind == "database":
+            return _build_database(action, manifest, manifest_data, force=force, dry_run=dry_run)
+        if kind == "zone_dialog":
+            return _build_zone_dialog(action, manifest, manifest_data, force=force, dry_run=dry_run)
+        if kind == "zone_npcs":
+            return _build_zone_npcs(action, manifest, manifest_data, force=force, dry_run=dry_run)
+        if kind == "zone_events":
+            return _build_zone_events(action, manifest, manifest_data, force=force, dry_run=dry_run,
+                                      apply=mode == "apply")
         raise click.ClickException(
             f"{action.get('id')}: build support for type {kind!r} is not implemented yet.")
 
     results = []
-    for action in active_actions:
-        kind = action.get("type")
-        if kind == "zone":
-            # Zone actions use the standard/hd package roots, not the live target.
-            if dry_run:
-                continue  # zone dry-run preview not modelled; skip
-            with _package_config(standard_root, hd_root):
-                result = _build_zone(action, manifest, manifest_data, redirect_root)
-        else:
-            # Place into every selected target (a dry-run just previews once).
-            result = None
-            for _name, root in (target_roots[:1] if dry_run else target_roots):
-                _set_target_root(root)
-                result = _dispatch(action, kind)
-        results.append(result)
-        # Record the allocation INLINE on the action (idempotent — overwrites the
-        # same key), so the manifest itself is the single source of truth. Track
-        # every target the DATs have been built into (union across builds).
-        if not dry_run and kind != "zone":
-            prior = set((action.get("result") or {}).get("targets") or [])
-            built = prior | {name for name, _ in target_roots}
-            # An ability's allocation (animation number, per-race placements) is
-            # decided by the build against the live tables, not by the definition
-            # alone, so it is taken from the build result rather than re-planned.
-            res = _ability_result(result) if kind == "ability" else _plan_result(action)
-            res["targets"] = [n for n in ("pivot", "dir", "hd") if n in built]
-            action["result"] = res
+    server_pairs = []           # (action, build result) of the ability actions, for the server pass
+    from xi.dats import xi_stage
+    with xi_stage.session(dry_run):
+        # A dry run holds what it would write, so each step sees the ones before it.
+        if reset:
+            _reset_tables(target_roots[0][1], reset_rels, dry_run, active_actions, opts.menu_record)
+        for action in active_actions:
+            kind = action.get("type")
+            if kind == "zone":
+                # Zone actions use the standard/hd package roots, not the live target.
+                if dry_run:
+                    continue  # zone dry-run preview not modelled; skip
+                with _package_config(standard_root, hd_root):
+                    result = _build_zone(action, manifest, manifest_data, redirect_root)
+            else:
+                # Place into every selected target (a dry-run just previews once).
+                result = None
+                for _name, root in (target_roots[:1] if dry_run else target_roots):
+                    _set_target_root(root)
+                    result = _dispatch(action, kind)
+            results.append(result)
+            if kind == "ability" and isinstance(result, dict):
+                server_pairs.append((action, result))
+            # Record the allocation INLINE on the action (idempotent — overwrites the
+            # same key), so the manifest itself is the single source of truth. Track
+            # every target the DATs have been built into (union across builds).
+            if not dry_run and kind != "zone":
+                prior = set((action.get("result") or {}).get("targets") or [])
+                built = prior | {name for name, _ in target_roots}
+                # An ability's allocation (animation number, per-race placements) is
+                # decided by the build against the live tables, not by the definition
+                # alone, so it is taken from the build result rather than re-planned.
+                if kind == "ability":
+                    res = _ability_result(result, action.get("result"))
+                elif kind in RECORD_TYPES:
+                    res = _record_result(result)   # the id is decided against the live table too
+                elif kind in RESTORABLE_TYPES:
+                    # Applied on top, the tables still hold what the last build changed: its
+                    # records stay, ahead of this build's (undo and --reset take both back).
+                    res = _database_result(result, action.get("result"),
+                                           keep=mode == "apply" and kind != "zone_events")
+                else:
+                    res = _plan_result(action)
+                res["targets"] = [n for n in ("pivot", "dir", "hd") if n in built]
+                action["result"] = res
 
     _set_target_root(None)
 
+    # The server pass (Database Update, Client Menu Record, Lua Stub) runs after every DAT
+    # is placed. It never raises: each step's outcome is a db: / menu: / lua: line.
+    server_kw = dict(root=target_roots[0][1], target=target, manifest_path=manifest,
+                     manifest=manifest_data, project=manifest_data.get("name") or manifest.stem)
+
     if dry_run:
+        if opts.any() and server_pairs:
+            SP.run(server_pairs, opts, dry_run=True, **server_kw)     # SELECT-only, reads files
         _print_placements(results, "Planned actions:")
-        if pack_actions:
+        if any(a.get("type") != "zone" for a in active_actions):
             click.echo("\nWould build into: " + ", ".join(str(r) for _n, r in target_roots))
         if dry_note:
             click.echo(click.style("\nDry run — nothing was written. Re-run without --dry-run to build.",
@@ -1568,12 +2920,15 @@ def build_cmd(manifest: Path | None, project: str | None, only: tuple[str, ...],
     # Persist the inline results back into the manifest (self-describing, idempotent).
     _write_manifest(manifest, manifest_data)
 
-    # The client reads lookup tables through the XIPivot overlay (FFXI_PIVOT_DIR)
-    # when set — it shadows the base install's FTABLE/VTABLE. Propagate the custom
-    # region (the file_ids we just registered) into any table the pivot overrides,
-    # so the new gear/entity models resolve there too and the sizes stay uniform
-    # (a size mismatch crashes the client). Retail-range pivot entries are kept.
-    if pack_actions:
+    # A client that loads FFXI_PIVOT_DIR through XIPivot reads that folder's ROM{n}
+    # tables in place of the install's (never its main FTABLE/VTABLE). Propagate the
+    # custom region (the gear/entity file_ids just registered) into each table the
+    # pivot folder carries, so those models resolve there too and the sizes stay
+    # uniform. Retail-range pivot entries are kept — so a job ability, spell or weapon
+    # skill registered only in the install stays invisible to that client; those are
+    # built with --pivot. A --pivot build registered in the pivot's own tables, which a
+    # copy of the base install's region would overwrite, so it skips this.
+    if pack_actions and not pivot:
         from xi.ftable.xi_expand import sync_pivot_from_base, pivot_root
         if pivot_root():
             click.echo(f"\nSyncing pivot overlay tables ({pivot_root()}) ...")
@@ -1581,11 +2936,166 @@ def build_cmd(manifest: Path | None, project: str | None, only: tuple[str, ...],
             click.echo(f"  synced {len(synced)} pivot table(s)" if synced
                        else "  (pivot tables already in sync)")
 
+    if opts.any() and server_pairs:
+        changed = SP.run(server_pairs, opts, dry_run=False, **server_kw)
+        if changed:
+            # The placements were recorded above, so a manifest that cannot be written now
+            # only loses what the pass did — which each step that wrote something says.
+            try:
+                _write_manifest(manifest, manifest_data)
+            except Exception as e:                  # noqa: BLE001 — the DATs are placed: exit 0
+                SP.warn_unrecorded(results, manifest, e)
+
     click.echo()
     if results:
         _print_placements(results, "Placed DATs:")
     for _name, root in target_roots:
         click.echo(click.style(f"\n✓ Built into {root}", fg="green"))
+    db_line = SP.database_line(results)
+    if db_line:
+        click.echo(db_line)
+
+
+RESTORABLE_TYPES = ("database", "zone_dialog", "zone_npcs", "zone_events")
+
+
+def _build_list(path: Path, *, reset: bool, pivot: bool, dry_run: bool, dry_note: bool, **build_kw) -> None:
+    """``xi dats build --list``: every project of a build list, first to last; with ``reset``,
+    every table any of them edits in place is reset from its ``.base`` once, first
+    (xi.dats.xi_build_list)."""
+    from xi.dats import xi_build_list as BL
+    from xi.dats import xi_stage
+    try:
+        doc = BL.load(path)
+    except BL.ListError as e:
+        raise click.ClickException(str(e))
+    # Every project is read and checked before any table is touched.
+    projects, problems = [], []
+    for entry in doc["projects"]:
+        p = BL.project_path(entry, path)
+        if not p.is_file():
+            problems.append(f"{entry}: no project file at {p}")
+            continue
+        try:
+            manifest = _read_manifest(p)
+        except click.ClickException as e:
+            problems.append(f"{entry}: {e.format_message()}")
+            continue
+        problems += [f"{entry}: {w}" for w in _manifest_problems(manifest)]
+        projects.append((p, manifest))
+    if problems:
+        raise click.ClickException(f"{path}: nothing was built —\n  " + "\n  ".join(problems))
+    target = "pivot" if pivot else "dir"
+    root = _target_root(target)
+    if pivot and not root.is_dir():
+        raise click.ClickException(f"FFXI_PIVOT_DIR does not exist: {root}")
+    edited = {r for _p, m in projects for r in _edited_tables(m, target)}
+
+    click.echo()
+    click.echo(f"{'Previewing' if dry_run else 'Building'} the build list {path}: "
+               f"{len(projects)} project{'s' if len(projects) != 1 else ''} into {_TARGET_LABELS[target]} -> {root}")
+    for i, (p, _m) in enumerate(projects, 1):
+        click.echo(f"  {i}. {p}")
+    with xi_stage.session(dry_run):
+        if reset:
+            actions = [a for _p, m in projects for a in m.get("actions", []) if isinstance(a, dict)]
+            _reset_tables(root, sorted(edited | set(BL.recorded(doc, target))), dry_run, actions,
+                          build_kw.get("menu_record"))
+        ctx = click.get_current_context()
+        for p, _m in projects:
+            _rule()
+            ctx.invoke(build_cmd, manifest=p, pivot=pivot, dry_run=dry_run, dry_note=False, fresh=reset, **build_kw)
+    if dry_run:
+        if dry_note:
+            click.echo(click.style("\nDry run — nothing was written. Re-run without --dry-run to build.", fg="cyan"))
+        return
+    # What the projects edit now; without a reset, what the list recorded before stays too
+    # (a dropped project's tables still hold its edits until a --reset takes them back).
+    now = {r for p, _m in projects for r in _edited_tables(_read_manifest(p), target)}
+    BL.record(doc, target, now if reset else now | set(BL.recorded(doc, target)))
+    BL.save(path, doc)
+    click.echo(click.style(f"\n✓ Built {len(projects)} project{'s' if len(projects) != 1 else ''} from {path}",
+                           fg="green"))
+
+
+def _reset_tables(root: Path, rels: list[str], dry_run: bool, actions: list[dict], menu_record) -> None:
+    """Reset ``rels`` in ``root`` to the install's untouched copy (--reset), and say what that
+    did: in the install from each table's ``.base``, into the pivot folder from the install."""
+    from xi.dats import xi_build_list as BL
+    done = BL.reset_tables(root, rels, dry_run)
+    n = len(done["restored"])
+    pivot = _root_target_name(root) == "pivot"
+    click.echo(f"\n{'Would reset' if dry_run else 'Reset'} {n} table{'s' if n != 1 else ''} "
+               + ("from the install (FFXI_DIR)" if pivot else "from .base"))
+    for rel in done["none"] if pivot else ():
+        click.echo(click.style(f"  ⚠ {rel} isn't in the install; left as it is", fg="yellow"))
+    if not menu_record and "ROM/118/114.DAT" in done["restored"]:
+        for a in actions:
+            menu = ((a.get("result") or {}).get("menu") if a.get("type") == "ability" else None) or {}
+            if _root_target_name(root) in (menu.get("roots") or {}):
+                click.echo(click.style(f"  ⚠ {a.get('id')}'s menu record in ROM/118/114.DAT went with the reset; "
+                                       "build with --menu-record to place it again", fg="yellow"))
+
+
+def _manifest_problems(manifest: dict) -> list[str]:
+    """What the validators of the table-editing types say about a project's actions."""
+    from xi.database.xi_core import validate_action as database
+    from xi.dialog.xi_zone_dialog import validate_action as zone_dialog
+    from xi.entity.xi_zone_npcs import validate_action as zone_npcs
+    from xi.event.xi_zone_events import validate_action as zone_events
+    checks = {"database": database, "zone_dialog": zone_dialog, "zone_npcs": zone_npcs, "zone_events": zone_events}
+    out = []
+    for action in manifest.get("actions", []):
+        check = checks.get(action.get("type")) if isinstance(action, dict) and action.get("enabled", True) else None
+        if check:
+            out += [f"{action.get('id')}: {e}" for e in check(action)]
+    return out
+
+
+def _edited_tables(manifest: dict, target: str) -> list[str]:
+    """ROM paths of the tables a project's builds into ``target`` edited in place — what
+    ``--reset`` resets: the database, dialog, NPC-name and event tables its records name, and
+    the spell / command table and its name tables for a record action; for a database or
+    zone_dialog action also the tables its edits name, so a project that hasn't been
+    built into ``target`` yet resets them too. The DATs actions place (gear, camera scenes …)
+    aren't: a build replaces them. Nor is an ability's menu record, which only a build with
+    --menu-record puts back."""
+    rels: set[str] = set()
+    for action in manifest.get("actions", []):
+        if not isinstance(action, dict) or _undone(action):
+            continue
+        typ, res = action.get("type"), action.get("result") or {}
+        if typ == "database" and action.get("enabled", True):
+            from xi.database import xi_build as DB
+            rels.update(DB.tables(action))
+        elif typ == "zone_dialog" and action.get("enabled", True):
+            from xi.dialog import xi_zone_dialog as ZD
+            try:
+                rels.update(ZD.tables(action, _target_root(target)))
+            except click.ClickException:
+                pass
+        if typ in RESTORABLE_TYPES:
+            for e in (res.get("roots") or {}).get(target) or []:
+                if e.get("dat"):
+                    rels.add(_rom_rel(e["dat"]))
+                rels.update(_rom_rel(ln["dat"]) for ln in e.get("lines") or [] if ln.get("dat"))
+        elif typ in RECORD_TYPES and target in _action_targets(action) and isinstance(res.get("record_id"), int):
+            rels.add(_rom_rel(res.get("dat") or "ROM/118/114.DAT"))
+            rels.update(_rom_rel(s) for s in res.get("strings") or [])
+    return sorted(rels)
+
+
+def _restorable_module(kind: str):
+    """The library of a restorable type: its ``undo(action, root, target, dry_run)``."""
+    if kind == "database":
+        from xi.database import xi_build as mod
+    elif kind == "zone_dialog":
+        from xi.dialog import xi_zone_dialog as mod
+    elif kind == "zone_npcs":
+        from xi.entity import xi_zone_npcs as mod
+    else:
+        from xi.event import xi_zone_events as mod
+    return mod
 
 
 def _project_built_targets(manifest_data: dict) -> list[str]:
@@ -1593,8 +3103,16 @@ def _project_built_targets(manifest_data: dict) -> list[str]:
     canonical order — read from each action's recorded ``result.targets``."""
     built: set[str] = set()
     for a in manifest_data.get("actions", []):
+        if _undone(a):
+            continue            # its DATs were cleared by an earlier undo that kept the manifest
         built.update((a.get("result") or {}).get("targets") or [])
     return [n for n in ("pivot", "dir", "hd") if n in built]
+
+
+def _undone(action: dict) -> bool:
+    """An action a `dats undo` already cleared (DATs, table entries, menu records) but kept
+    in the manifest because a database row or Lua stub it made is still there."""
+    return bool((action.get("result") or {}).get("undone"))
 
 
 def _action_placements(action: dict) -> list[tuple[int, str]]:
@@ -1606,6 +3124,17 @@ def _action_placements(action: dict) -> list[tuple[int, str]]:
         for p in res.get("placements", []):
             if p.get("file_id") is not None and p.get("dat"):
                 out.append((int(p["file_id"]), _rom_rel(p["dat"])))
+    elif action.get("type") == "zone_events":
+        # Each camera scene DAT an event placed (the event and dialog tables are restored).
+        for recs in (res.get("roots") or {}).values():
+            for rec in recs:
+                cam = rec.get("camera")
+                if isinstance(cam, dict) and (int(cam["file_id"]), _rom_rel(cam["dat"])) not in out:
+                    out.append((int(cam["file_id"]), _rom_rel(cam["dat"])))
+    elif action.get("type") in RESTORABLE_TYPES:
+        pass
+    elif action.get("type") == "copy":
+        pass        # undo takes the file back out itself (xi.dats.xi_copy.undo), and clears its file_id
     elif res.get("file_id") is not None and res.get("dat"):
         out.append((int(res["file_id"]), _rom_rel(res["dat"])))
     return out
@@ -1613,24 +3142,29 @@ def _action_placements(action: dict) -> list[tuple[int, str]]:
 
 def _unregister_file_id(root: Path, file_id: int, rom: int) -> bool:
     """Clear a file_id's entry (ftval + vtable version -> 0, so it resolves to
-    nothing) in ``root``'s base + ROM{rom} tables. No-op (returns False) if the
-    target has no FTABLE (a DAT-only overlay)."""
-    if not (root / "FTABLE.DAT").exists():
-        return False
-    _patch_raw_table(root / "FTABLE.DAT", root / "VTABLE.DAT", file_id, 0, 0)
+    nothing) in the tables a build of ``root`` registers it in
+    (``patch_launcher_tables``): the ROM{rom} pair, and its main pair when that holds the
+    id — in a pivot folder only for a ROM{rom} placement (a ROM/ one there registered
+    nothing: the id was already retail's). False when ``root`` has none of them."""
+    pairs = []
     if rom != 1:
-        ft, vt = root / f"ROM{rom}" / f"FTABLE{rom}.DAT", root / f"ROM{rom}" / f"VTABLE{rom}.DAT"
-        if ft.exists():
+        pairs.append((root / f"ROM{rom}" / f"FTABLE{rom}.DAT", root / f"ROM{rom}" / f"VTABLE{rom}.DAT"))
+    if rom != 1 or _root_target_name(root) == "dir":
+        pairs.append((root / "FTABLE.DAT", root / "VTABLE.DAT"))
+    cleared = False
+    for ft, vt in pairs:
+        if _table_holds(ft, vt, file_id):
             _patch_raw_table(ft, vt, file_id, 0, 0)
-    return True
+            cleared = True
+    return cleared
 
 
 def _pick_project(verb: str) -> str:
-    """List the dats/*.json projects and prompt for one (used when a command's
+    """List the projects/*.json projects and prompt for one (used when a command's
     project argument is omitted)."""
     names = _existing_project_names()
     if not names:
-        raise click.ClickException("No projects found (dats/*.json).")
+        raise click.ClickException("No projects found (projects/*.json).")
     click.echo(f"\n>> Which project to {verb}?")
     for i, n in enumerate(names, 1):
         click.echo(f"  {i}. {n}")
@@ -1638,37 +3172,75 @@ def _pick_project(verb: str) -> str:
     return names[click.prompt("Enter number", type=click.IntRange(1, len(names))) - 1]
 
 
-def _project_dat_rels(manifest_data: dict) -> tuple[list[str], bool]:
+def _action_targets(action: dict) -> list[str]:
+    """Targets an action was built into (``result.targets``). A result from before
+    targets were recorded counts as the base install."""
+    res = action.get("result") or {}
+    return res.get("targets") or (["dir"] if res else [])
+
+
+def _project_dat_rels(manifest_data: dict, target: str | None = None) -> tuple[list[str], bool]:
     """ROM-relative DATs a project's actions produced (from inline results), plus
-    whether it has any mount action (whose d_msg string DATs must ship too)."""
+    whether it has any mount action (whose d_msg string DATs must ship too). With
+    ``target``, only the actions built into that target count."""
     rels: list[str] = []
     has_mount = False
     for action in manifest_data.get("actions", []):
         typ = action.get("type")
         res = action.get("result") or {}
+        if _undone(action):
+            continue
+        if target is not None and target not in _action_targets(action):
+            continue
         if typ in ("gear", "ability"):
             rels += [_rom_rel(p["dat"]) for p in res.get("placements", []) if p.get("dat")]
+            menu = res.get("menu") if typ == "ability" else None
+            roots = (menu or {}).get("roots") or {}
+            if isinstance(menu, dict) and roots and (target is None or target in roots):
+                # The Client Menu Record: the shared menu table and the name/help tables it
+                # edited ship with the ability, or players get it with no menu entry.
+                from xi.menu.xi_menu_table import string_tables
+                rk = menu.get("record_kind") or ("spell" if menu.get("kind") == "spell" else "command")
+                rels += [_rom_rel("ROM/118/114.DAT")] + [_rom_rel(s) for s in string_tables(rk)]
+        elif typ in RECORD_TYPES:
+            # The shared menu table plus the name/help tables the build edited.
+            rels += [_rom_rel(res.get("dat") or "ROM/118/114.DAT")]
+            rels += [_rom_rel(s) for s in res.get("strings") or []]
+        elif typ in RESTORABLE_TYPES:
+            # The item DATs / string / dialog / event tables whose records it changed, in each
+            # target, and a zone_events action's camera scene DATs.
+            for tname, recs in (res.get("roots") or {}).items():
+                if target is None or tname == target:
+                    rels += [_rom_rel(e["dat"]) for e in recs if e.get("dat")]
+                    for e in recs:
+                        rels += [_rom_rel(ln["dat"]) for ln in e.get("lines") or [] if ln.get("dat")]
+                        if isinstance(e.get("camera"), dict):
+                            rels.append(_rom_rel(e["camera"]["dat"]))
+        elif typ == "copy":
+            if res.get("path"):
+                rels.append(res["path"])
         elif res.get("dat"):
             rels.append(_rom_rel(res["dat"]))
         if typ == "mount":
             has_mount = True
-    return rels, has_mount
+    return sorted(set(rels)), has_mount
 
 
 @group.command("package")
 @click.argument("project", required=False, default=None)
-@click.option("--from", "source", type=click.Choice(["dir", "pivot", "hd"]), default="dir", show_default=True,
-              help="Read the built DATs + tables from the base install ('dir', default), "
-                   "FFXI_PIVOT_DIR ('pivot'), or FFXI_HD_DIR ('hd').")
+@click.option("--from", "source", type=click.Choice(["dir", "pivot", "hd"]), default=None,
+              help="Read the built DATs + tables from the base install ('dir'), FFXI_PIVOT_DIR "
+                   "('pivot'), or FFXI_HD_DIR ('hd'). Default: where the project was built — "
+                   "'pivot' when every build used --pivot, else 'dir'.")
 @click.option("--output", "output", type=click.Path(path_type=Path), default=None,
-              help="Output zip path (default dats/packages/<project>.zip).")
-def package_cmd(project: str | None, source: str, output: Path | None):
+              help="Output zip path (default projects/packages/<project>.zip).")
+def package_cmd(project: str | None, source: str | None, output: Path | None):
     """Zip a project's built DATs + F/V tables into a distributable overlay pack.
 
-    With no PROJECT, lists the dats/*.json projects to pick from. Reads from the base
-    install by default (where builds land); collects every DAT the project's actions
-    placed (from each action's inline result), the mount string DATs for any mount
-    actions, and the full FTABLE/VTABLE set — into a single zip laid out ROM-relative.
+    With no PROJECT, lists the projects/*.json projects to pick from. Reads from where the
+    project was built; collects every DAT the actions built there placed (from each
+    action's inline result), the mount string DATs for any mount actions, and the full
+    FTABLE/VTABLE set — into a single zip laid out ROM-relative.
     """
     import zipfile
 
@@ -1678,11 +3250,13 @@ def package_cmd(project: str | None, source: str, output: Path | None):
     if not manifest_path.exists():
         raise click.ClickException(f"No manifest at {manifest_path}.")
     manifest_data = _read_manifest(manifest_path)
+    if source is None:
+        source = "pivot" if _project_built_targets(manifest_data) == ["pivot"] else "dir"
     root = _target_root(source)
     if not (root / "FTABLE.DAT").exists():
         raise click.ClickException(f"No FTABLE.DAT under {root}.")
 
-    dat_rels, has_mount = _project_dat_rels(manifest_data)
+    dat_rels, has_mount = _project_dat_rels(manifest_data, target=source)
     table_rels = [rel.as_posix() for rel in _table_rel_paths() if (root / rel).exists()]
     # Mount name/help/key-item string DATs (shared d_msg tables the mount build edits).
     if has_mount:
@@ -1729,10 +3303,11 @@ def release_cmd(project: str | None, release_root: Path | None, no_dll: bool):
     the patched FFXiMain.dll — into `<release>\\Game\\FINAL FANTASY XI\\...`, mirroring
     the game's folder layout so the launcher deploys them straight to the client.
 
-    Also stages the XIPivot overlay's synced F/V tables (from FFXI_PIVOT_DIR),
-    since the client reads those over the base install's tables — the build must
-    carry them or the overlay shadows the base with stale/retail tables and
-    crashes.
+    Also stages the pivot folder's synced F/V tables (from FFXI_PIVOT_DIR): the
+    client reads its ROM{n} tables over the base install's, so the release must carry
+    the same copies or they shadow the base with stale/retail ones. DATs of actions
+    built with --pivot are staged from FFXI_PIVOT_DIR into that same pivot folder of
+    the release.
     """
     if not project:
         project = _pick_project("release")
@@ -1740,7 +3315,7 @@ def release_cmd(project: str | None, release_root: Path | None, no_dll: bool):
     if not manifest_path.exists():
         raise click.ClickException(f"No manifest at {manifest_path}.")
     manifest_data = _read_manifest(manifest_path)
-    src_root = _target_root("dir")  # builds land in the base install
+    src_root = _target_root("dir")  # builds without --pivot land in the base install
 
     if release_root is None:
         click.echo("\n>> Launcher build release folder")
@@ -1749,7 +3324,7 @@ def release_cmd(project: str | None, release_root: Path | None, no_dll: bool):
 
     # What to ship: the project's DATs (+ mount d_msg), the full F/V table set, and
     # the patched DLL (the model->file_id map the client reads at boot).
-    dat_rels, has_mount = _project_dat_rels(manifest_data)
+    dat_rels, has_mount = _project_dat_rels(manifest_data, target="dir")
     if has_mount:
         for sub in ("ROM/351", "ROM/175"):
             d = src_root / Path(*sub.split("/"))
@@ -1779,13 +3354,14 @@ def release_cmd(project: str | None, release_root: Path | None, no_dll: bool):
     for r in missing:
         click.echo(click.style(f"  ⚠ not in base install (build first?): {r}", fg="yellow"))
 
-    # Also stage the XIPivot overlay's F/V tables. The client reads these OVER the
-    # base install's tables (redirect_fopens), so the build must carry the same
-    # synced/expanded copies or the overlay shadows the base with stale tables and
-    # the client crashes on a size mismatch. Mirrors the pivot folder layout under
+    # Also stage the pivot folder's F/V tables. The client reads its ROM{n} tables
+    # OVER the base install's (XIPivot; the main FTABLE/VTABLE always come from the
+    # install), so the build must carry the same synced/expanded copies or they shadow
+    # the base with stale ones. Mirrors the pivot folder layout under
     # <release>\Ashita\polplugins\DATs\catseyexi (created here, full path).
     from xi.xi_config import FFXI_PIVOT_DIR
-    pivot_copied = 0
+    pivot_copied = pivot_dats = 0
+    pivot_rels, pivot_mount = _project_dat_rels(manifest_data, target="pivot")
     if FFXI_PIVOT_DIR and Path(FFXI_PIVOT_DIR).is_dir():
         piv_src = Path(FFXI_PIVOT_DIR)
         piv_dest = release_root / _LAUNCHER_PIVOT_PARENT / piv_src.name
@@ -1797,11 +3373,31 @@ def release_cmd(project: str | None, release_root: Path | None, no_dll: bool):
             d.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, d)
             pivot_copied += 1
+        # DATs of actions built with --pivot live in that folder, so they ship in it.
+        if pivot_mount:
+            for sub in ("ROM/351", "ROM/175"):
+                d = piv_src / Path(*sub.split("/"))
+                if d.is_dir():
+                    pivot_rels += [f"{sub}/{f.name}" for f in d.iterdir() if f.suffix.lower() == ".dat"]
+        for rel in sorted(set(pivot_rels)):
+            s = piv_src / Path(*rel.split("/"))
+            if not s.exists():
+                click.echo(click.style(f"  ⚠ not in FFXI_PIVOT_DIR (build with --pivot first?): {rel}",
+                                       fg="yellow"))
+                continue
+            d = piv_dest / Path(*rel.split("/"))
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, d)
+            pivot_dats += 1
+    elif pivot_rels:
+        click.echo(click.style("  ⚠ some actions were built with --pivot, but FFXI_PIVOT_DIR is not "
+                               "configured — their DATs are not staged", fg="yellow"))
 
     n_tables = len([r for r in rels if r in table_rels])
     n_dat = len([r for r in rels if r in dat_rels])
     dll = " + FFXiMain.dll" if (not no_dll and "FFXiMain.dll" in rels) else ""
     pivot = f" + {pivot_copied} pivot table(s)" if pivot_copied else ""
+    pivot += f" + {pivot_dats} pivot DAT(s)" if pivot_dats else ""
     click.echo(click.style(
         f"✓ Released {n_dat} DAT(s) + {n_tables} F/V table file(s){dll}{pivot} -> {dest_base}",
         fg="green"))
@@ -1812,16 +3408,28 @@ def release_cmd(project: str | None, release_root: Path | None, no_dll: bool):
 @click.option("--yes", is_flag=True, default=False, help="Skip the confirmation prompt.")
 @click.option("--keep-json", is_flag=True, default=False,
               help="Undo the built DATs + table entries but keep the manifest JSON.")
-def undo_cmd(project: str | None, yes: bool, keep_json: bool):
+@click.option("--apply-db", is_flag=True, default=False,
+              help="Also revert the database rows and delete the Lua stubs the project's abilities wrote.")
+def undo_cmd(project: str | None, yes: bool, keep_json: bool, apply_db: bool = False):
     """Undo a project's build and remove it.
 
-    With no PROJECT, lists the dats/*.json projects to pick from. For every target
+    With no PROJECT, lists the projects/*.json projects to pick from. For every target
     the project was built into (recorded on each action's `result.targets`): delete
     the DAT files it placed, clear their file_id entries from that target's
-    FTABLE/VTABLE, and (for mounts) blank the name/help/key-item strings. Then delete
-    the `dats/<project>.json` manifest unless `--keep-json`.
+    FTABLE/VTABLE, (for mounts) blank the name/help/key-item strings, and put back
+    the client menu record an ability placed (only while the row still holds what the
+    build wrote). With --apply-db, also revert the database row an ability inserted or
+    changed and delete the Lua stub it wrote (only while it is unedited). Then delete
+    the `projects/<project>.json` manifest — unless `--keep-json`, or a database row or stub
+    is still there, or a menu record couldn't be put back (a locked 114.DAT while the game
+    runs): then the manifest is kept (the cleared actions marked `undone`), so a later
+    undo (`--apply-db` for the server side) can finish the job.
     """
     from xi.mount import xi_core as M
+    from xi.server import xi_db_apply as DBA
+    from xi.server import xi_lua_stub as LS
+    from xi.server import xi_server_pass as SP
+    from xi.server.xi_step import DASH, current_server_dir, now_iso, q
 
     if not project:
         project = _pick_project("undo")
@@ -1831,21 +3439,75 @@ def undo_cmd(project: str | None, yes: bool, keep_json: bool):
         raise click.ClickException(f"No manifest at {manifest_path}.")
     manifest_data = _read_manifest(manifest_path)
     actions = manifest_data.get("actions", [])
+    live = [a for a in actions if not _undone(a)]      # what this run clears
+    live_ids = {id(a) for a in live}
     built = _project_built_targets(manifest_data)
-    n_placements = sum(len(_action_placements(a)) for a in actions)
+    n_placements = (sum(len(_action_placements(a)) for a in live)
+                    + sum(1 for a in live if a.get("type") == "copy"))
+    proj_name = manifest_data.get("name") or manifest_path.stem
+    abilities = [a for a in actions if a.get("type") == "ability" and isinstance(a.get("result"), dict)]
+    db_acts = [(a, a["result"]["db"]) for a in abilities if SP.db_needs_undo(a["result"].get("db"))]
+    lua_acts = [(a, a["result"]["lua"]) for a in abilities
+                if isinstance(a["result"].get("lua"), dict) and a["result"]["lua"].get("path")]
 
+    # Menu records an earlier undo couldn't put back (a locked 114.DAT): it kept them on
+    # the action it marked undone, so this run tries them again (menu only; no --apply-db
+    # needed — the DATs and table entries went last time).
+    retry = [a for a in abilities if _undone(a) and isinstance(a["result"].get("menu"), dict)
+             and a["result"]["menu"].get("roots")]
+    retry_ids = {id(a) for a in retry}
     click.echo(f"\nUndo {manifest_path.stem}:")
-    click.echo(f"  built into: {', '.join(built) if built else '(none recorded — nothing to remove in-game)'}")
+    none_built = ("(its DATs went with an earlier undo)" if retry else "(none recorded — nothing to remove in-game)")
+    click.echo(f"  built into: {', '.join(built) if built else none_built}")
     click.echo(f"  DATs:       {n_placements} file(s) in each target")
-    click.echo(f"  manifest:   {manifest_path}" + ("  (kept)" if keep_json else "  (deleted)"))
+    for a in abilities:
+        res = a["result"]
+        if isinstance(res.get("db"), dict):
+            click.echo(f"  database:   {SP.describe_db(res['db'])}")
+        menu = res.get("menu")
+        if isinstance(menu, dict) and (id(a) in live_ids or id(a) in retry_ids):
+            label = DBA.KIND_LABEL.get(menu.get("kind"), menu.get("record_kind") or "record")
+            again = "" if id(a) in live_ids else "; it couldn't be last time"
+            for rname in (menu.get("roots") or {}):
+                click.echo(f"  menu:       {label} {menu.get('server_id')} in {rname} "
+                           f"(the placeholder is put back{again})")
+        if isinstance(res.get("lua"), dict) and res["lua"].get("path"):
+            click.echo(f"  lua stub:   {res['lua']['path']} (removed with --apply-db)")
+    has_menu = any(isinstance(a["result"].get("menu"), dict) and a["result"]["menu"].get("roots")
+                   for a in abilities if id(a) in live_ids or id(a) in retry_ids)
+    manifest_note = ("kept" if keep_json else "deleted once nothing is left" if (db_acts or lua_acts or has_menu)
+                     else "deleted")
+    click.echo(f"  manifest:   {manifest_path}  ({manifest_note})")
     if not yes and not click.confirm("\nProceed?", default=False):
         click.echo("Aborted — nothing changed.")
         return
 
-    removed = cleared = 0
+    removed = cleared = restored = 0
+    db_left: list[str] = []         # database fields left as they are (changed since the build)
+    menu_err: dict = {}             # id(action) -> {root name: label}: restores that failed (kept, retried)
+
+    def undo_menu_in(action: dict, rname: str, root, warns: list) -> int:
+        """Put back ``action``'s menu record in root ``rname`` (only while the row still
+        holds what the build wrote). 1 when it was restored now. A failure (a locked
+        114.DAT) is remembered in ``menu_err`` so the manifest keeps it for the next undo."""
+        menu = (action.get("result") or {}).get("menu")
+        rs = ((menu or {}).get("roots") or {}).get(rname) if isinstance(menu, dict) else None
+        if not (isinstance(rs, dict) and isinstance(rs.get("record_id"), int)):
+            return 0
+        outcome, warn = SP.undo_menu(menu, rname, root)
+        if outcome == "error":
+            menu_err.setdefault(id(action), {})[rname] = SP.menu_record_label(menu, rname)
+        if warn:
+            warns.append(warn)
+        return 1 if outcome == "restored" else 0
+
     for name in built:
         root = _target_root(name)
-        for action in actions:
+        menu_left = []
+        here = 0
+        for action in live:
+            if name not in _action_targets(action):
+                continue   # never built here: whatever this folder holds at those paths is not ours
             for file_id, dat in _action_placements(action):
                 rom = _parse_rom_placement(dat)[0]
                 p = root / Path(*dat.split("/"))
@@ -1859,15 +3521,223 @@ def undo_cmd(project: str | None, yes: bool, keep_json: bool):
                 if isinstance(mid, int):
                     with _package_config(root, root):
                         M.clear_mount_strings(mid)
-        click.echo(f"  ✓ {name}: DATs deleted + table entries cleared")
+            if action.get("type") == "copy":
+                from xi.dats import xi_copy as CP
+                try:
+                    src = _resolve_raw_source((action.get("resources") or {}).get("file") or "",
+                                              manifest_path, manifest_data)
+                except click.ClickException:
+                    src = None
+                n, warns = CP.undo(action, root, in_install=name == "dir", src=src)
+                removed += n
+                db_left.extend(warns)
+                res = action.get("result") or {}
+                fid = res.get("file_id", (action.get("target") or {}).get("file_id"))
+                rel = res.get("path") or CP.rel_path((action.get("target") or {}).get("path"))
+                if fid is not None and rel and _unregister_file_id(root, int(fid), _parse_rom_placement(rel)[0]):
+                    cleared += 1
+            if action.get("type") in RECORD_TYPES:
+                res = action.get("result") or {}
+                if isinstance(res.get("record_id"), int):
+                    # Put back what a forced overwrite replaced, else empty the row.
+                    from xi.menu.xi_menu_table import restore_record
+                    restore_record(action["type"], root, res["record_id"], res.get("replaced"))
+                    cleared += 1
+            if action.get("type") == "ability":
+                # The Client Menu Record: put back the placeholder, only while the row still
+                # holds the bytes the build wrote (a retail update may have taken it since).
+                cleared += undo_menu_in(action, name, root, menu_left)
+        # The records, lines, names and events the restorable types changed go back to what
+        # they held before the build, newest action first (a stack: where two changed one
+        # table, each gets back what it changed). What something else changed since is left,
+        # and said.
+        for action in reversed(live):
+            if name in _action_targets(action) and action.get("type") in RESTORABLE_TYPES:
+                n, warns = _restorable_module(action["type"]).undo(action, root, name)
+                here += n
+                db_left.extend(warns)
+        restored += here
+        click.echo(f"  ✓ {name}: DATs deleted + table entries cleared"
+                   + (f", {here} record{'s' if here != 1 else ''} put back" if here else ""))
+        for w in db_left:
+            click.echo(click.style(f"  ⚠ {w}", fg="yellow"))
+        db_left.clear()
+        for w in menu_left:
+            click.echo(click.style(f"  ⚠ menu: {w}", fg="yellow"))
 
-    if not keep_json:
+    # The proposed SQL (and a zone_events action's Lua) goes with the action.
+    for action in live:
+        if action.get("type") not in RESTORABLE_TYPES:
+            continue
+        res = action.get("result") or {}
+        for key, what in (("sql", "SQL"), ("lua", "Lua")):
+            path = res.get(key)
+            if isinstance(path, str) and path:
+                from xi.database import xi_build as DB
+                if DB.remove_sql_section(Path(path), action["id"]):
+                    click.echo(f"  ✓ removed {action['id']}'s {what} from {path}")
+
+    # The menu records an earlier undo couldn't put back.
+    for name in [n for n in ("pivot", "dir", "hd")
+                 if any(n in a["result"]["menu"]["roots"] for a in retry)]:
+        menu_left = []
+        try:
+            root = _target_root(name)
+        except click.ClickException as e:           # e.g. FFXI_PIVOT_DIR unset since
+            for a in retry:
+                if name in a["result"]["menu"]["roots"]:
+                    lbl = SP.menu_record_label(a["result"]["menu"], name)
+                    menu_err.setdefault(id(a), {})[name] = lbl
+                    menu_left.append(f"couldn't put back {lbl} ({e.format_message()})")
+            root = None
+        n = 0
+        if root is not None:
+            for a in retry:
+                n += undo_menu_in(a, name, root, menu_left)
+        cleared += n
+        if n:
+            click.echo(f"  ✓ {name}: {n} menu record{'s' if n != 1 else ''} put back")
+        for w in menu_left:
+            click.echo(click.style(f"  ⚠ menu: {w}", fg="yellow"))
+
+    # The server side: the database rows and Lua stubs the abilities wrote.
+    left_db: dict = {}              # action id -> "spell_list #1023"
+    left_lua: dict = {}             # action id -> path
+    reverted: set = set()
+    stub_gone: set = set()
+    if apply_db:
+        if db_acts:
+            conn, why = None, None
+            if DBA.configured() is None:
+                why = DBA.NOT_CONFIGURED
+            else:
+                try:
+                    conn = DBA.connect()
+                except DBA.DbUnavailable as e:
+                    why = str(e)
+            n_db = 0
+            for a, db in db_acts:
+                what = f"{db.get('table')} #{db.get('id')}"
+                if conn is None:
+                    click.echo(click.style(f"  db: left {what} {DASH} {why}", fg="yellow"))
+                    left_db[a.get("id")] = what
+                    continue
+                try:
+                    op, now = DBA.revert(conn, db)
+                except Exception as e:              # noqa: BLE001
+                    click.echo(click.style(f"  db: left {what} {DASH} {DBA.friendly_db_error(e)}", fg="yellow"))
+                    left_db[a.get("id")] = what
+                    continue
+                if op in ("deleted", "reverted"):
+                    tail = ("" if op == "deleted" else
+                            f" animation {db.get('animation')} -> {(db.get('before') or {}).get('animation')}")
+                    click.echo(f"  db: {op} {what} {q(db.get('name') or '')}{tail}")
+                    n_db += 1
+                elif op == "gone":                  # a dbtool re-import, a hand delete: nothing to do
+                    click.echo(f"  db: {what} is already gone")
+                elif op == "already":
+                    click.echo(f"  db: {what} already has animation {now['animation']}")
+                elif op == "other":
+                    click.echo(click.style(f"  db: {what} now holds {q(now['name'])}, not {q(db.get('name') or '')} "
+                                           f"{DASH} not this mix's row; left as it is", fg="yellow"))
+                elif op not in DBA.REVERT_DONE:     # "changed": still there with other values
+                    held = (f"; it holds animation {now['animation']} now"
+                            if now and now.get("animation") is not None else "")
+                    click.echo(click.style(f"  db: left {what} (it changed since{held})", fg="yellow"))
+                    left_db[a.get("id")] = what
+                    continue
+                reverted.add(a.get("id"))           # nothing of this mix is left in that row
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:                   # noqa: BLE001
+                    pass
+            if n_db:
+                click.echo("  restart the map server (xi_map) to load the change")
+        server_dir = current_server_dir()
+        n_lua = 0
+        for a, lua in lua_acts:
+            path = lua["path"]
+            if not server_dir:
+                click.echo(click.style(f"  lua: left {path} {DASH} no server folder", fg="yellow"))
+                left_lua[a.get("id")] = path
+                continue
+            outcome, why = LS.remove_stub(server_dir, lua, project=proj_name, action=a.get("id"))
+            if outcome == "removed":
+                click.echo(f"  lua: removed {path}")
+                stub_gone.add(a.get("id"))
+                n_lua += 1
+            elif outcome == "missing":
+                click.echo(f"  lua: {path} is already gone")
+                stub_gone.add(a.get("id"))
+            else:
+                click.echo(click.style(f"  lua: left {path} {DASH} {why}", fg="yellow"))
+                left_lua[a.get("id")] = path
+        if n_lua:
+            click.echo("  restart the map server to unload it")
+    elif db_acts or lua_acts:
+        for a, db in db_acts:
+            try:
+                sql = DBA.revert_sql(db)
+            except (ValueError, KeyError, TypeError):
+                sql = None
+            click.echo(click.style(f"  db: {sql or SP.describe_db(db)}", fg="yellow"))
+            left_db[a.get("id")] = f"{db.get('table')} #{db.get('id')}"
+        server_dir = current_server_dir()
+        for a, lua in lua_acts:
+            where = f" (in {server_dir})" if server_dir else ""
+            click.echo(click.style(f"  lua stub: {lua['path']}{where}", fg="yellow"))
+            left_lua[a.get("id")] = lua["path"]
+        click.echo(click.style("  database and server scripts left as they are; run again with --apply-db "
+                               "to revert them", fg="yellow"))
+
+    left_menu = [lbl for a in actions for lbl in (menu_err.get(id(a)) or {}).values()]
+    left = [*left_db.values(), *left_lua.values(), *left_menu]
+    kept = keep_json or bool(left)
+    if not kept:
         manifest_path.unlink()
+    elif not keep_json:
+        # Something is still there: keep the manifest so a later undo can remove it, with
+        # what this run cleared marked (and no longer counted). A menu record that couldn't
+        # be put back stays on its action (only the roots that failed) for the next undo.
+        now = now_iso()
+        for a in actions:
+            res = a.get("result")
+            if not isinstance(res, dict):
+                continue
+            if id(a) in live_ids:
+                res["undone"] = now
+            if (id(a) in live_ids or id(a) in retry_ids) and isinstance(res.get("menu"), dict):
+                failed = menu_err.get(id(a)) or {}
+                roots = {k: v for k, v in (res["menu"].get("roots") or {}).items() if k in failed}
+                if roots:
+                    res["menu"] = {**res["menu"], "roots": roots}
+                else:
+                    res.pop("menu", None)
+            if a.get("id") in reverted:
+                res.pop("db", None)
+            if a.get("id") in stub_gone:
+                res.pop("lua", None)
+        try:
+            _write_manifest(manifest_path, manifest_data)
+        except OSError as e:
+            click.echo(click.style(f"  ⚠ couldn't update {manifest_path} ({e}); the next undo repeats this "
+                                   "one (what's already gone is skipped)", fg="yellow"))
 
-    tail = "" if keep_json else f", removed {manifest_path.name}"
+    tail = "" if kept else f", removed {manifest_path.name}"
+    put_back = f", put back {restored} record{'s' if restored != 1 else ''}" if restored else ""
     click.echo(click.style(
         f"\n✓ Undone. Deleted {removed} DAT{'s' if removed != 1 else ''}, "
-        f"cleared {cleared} table entr{'ies' if cleared != 1 else 'y'}{tail}.", fg="green"))
+        f"cleared {cleared} table entr{'ies' if cleared != 1 else 'y'}{put_back}{tail}.", fg="green"))
+    if left and not keep_json:
+        what = " and ".join(left)
+        verb = "is" if len(left) == 1 else "are"
+        if left_db or left_lua:
+            how = f"run xi dats undo {manifest_path.stem} --apply-db to remove them"
+        else:
+            how = (f"close the game and run xi dats undo {manifest_path.stem} again to put "
+                   f"{'it' if len(left) == 1 else 'them'} back")
+        click.echo(click.style(f"manifest kept: {what} {verb} still there; {how}", fg="yellow"))
 
 
 def _print_placements(results: list[dict], title: str) -> None:
@@ -1887,23 +3757,154 @@ def _print_placements(results: list[dict], title: str) -> None:
                 click.echo(f"     - {mark}{line}")
                 if "occupied by" in line:
                     collisions += 1
-        elif kind == "ability":
-            files = r.get("placements", [])
-            click.echo(f"{head}: {r.get('kind')} animation {r.get('animation')} "
-                       f"— {len(files)} DAT{'s' if len(files) != 1 else ''}")
-            for p in files:
-                who = f"{p.get('race') or 'all races'} {p['role']}"
-                occ = p.get("occupied_by")
-                mark = "⚠ " if occ else ""
-                click.echo(f"     - {mark}file_id {p['file_id']:>6}  {who:<26} -> {p['dat']}"
-                           + (f"   (occupied by {occ})" if occ else ""))
-                if occ:
-                    collisions += 1
+        elif kind in RECORD_TYPES:
+            mi = f", menu index {r['menu_index']}" if r.get("menu_index") is not None else ""
+            click.echo(f"{head}: {kind} {r.get('record_id')} \"{r.get('name')}\" "
+                       f"cloned from {r.get('copy_from')}{mi} -> {r.get('dat')}")
+            if r.get("moved_from") is not None:
+                click.echo(f"     - moved from {kind} {r['moved_from']}, which is put back")
+            if r.get("replaced"):
+                click.echo(click.style(f"     ⚠ writes over the record that was at {r.get('record_id')} "
+                                       "(--force); undo puts it back", fg="yellow"))
+            for s in r.get("strings") or []:
+                click.echo(f"     - names/help: {s}")
+            if r.get("warning"):
+                click.echo(click.style(f"     ⚠ {r['warning']}", fg="yellow"))
             if r.get("server"):
                 click.echo(f"     server: {r['server']}")
             if r.get("sql"):
                 for line in r["sql"].splitlines():
                     click.echo(f"       {line}")
+        elif kind == "database":
+            recs = r.get("records") or []
+            where = ", ".join(r.get("files") or []) or "no DAT changes"
+            click.echo(f"{head}: {len(recs)} record{'s' if len(recs) != 1 else ''} -> {where}")
+            for e in recs:
+                name = f" \"{e['name']}\"" if e.get("name") else ""
+                tag = "  (new, a copy of its copy_from)" if e.get("created") else ""
+                click.echo(f"     - {e['table']} {e['id']}{name} [{e['lang']}] {e['dat']} block {e['block']}{tag}")
+                for key, ch in (e.get("changed") or {}).items():
+                    if key == "icon":
+                        click.echo(f"         icon -> {ch['to']}")
+                    else:
+                        click.echo(f"         {key}: {_short(ch['from'])} -> {_short(ch['to'])}")
+            for w in r.get("warnings") or []:
+                click.echo(click.style(f"     ⚠ {w}", fg="yellow"))
+            if r.get("server"):
+                click.echo(f"     server (proposed, not run): {r['server']}")
+            if r.get("sql"):
+                for line in r["sql"].splitlines():
+                    click.echo(f"       {line}")
+        elif kind == "zone_npcs":
+            recs = r.get("records") or []
+            where = ", ".join(r.get("files") or []) or "no DAT changes"
+            click.echo(f"{head}: zone {r.get('zone')}, {len(recs)} name{'s' if len(recs) != 1 else ''} -> {where}")
+            for e in recs:
+                what = "new" if e.get("created") else f"renamed from {e['from']!r}"
+                click.echo(f"     - NPC {e['local']:#x} ({e['sid']:#010x}) {e['to']!r}: {what}")
+            for w in r.get("warnings") or []:
+                click.echo(click.style(f"     ⚠ {w}", fg="yellow"))
+            if r.get("server"):
+                click.echo(f"     server (proposed, not run): {r['server']}")
+            if r.get("sql"):
+                for line in r["sql"].splitlines():
+                    click.echo(f"       {line}")
+        elif kind == "zone_events":
+            recs = r.get("records") or []
+            where = ", ".join(r.get("files") or []) or "no DAT changes"
+            click.echo(f"{head}: zone {r.get('zone')}, {len(recs)} event{'s' if len(recs) != 1 else ''} -> {where}")
+            for e in recs:
+                blocks = e.get("blocks") or []
+                new_blocks = sum(1 for b in blocks if b.get("created"))
+                en = [ln for ln in e.get("lines") or [] if ln.get("lang") == "en"]
+                n_lines = sum((ln["grew"][1] - ln["grew"][0]) if ln.get("grew") else 1 for ln in en)
+                who = f"{e['npc']} ({e['actor']})" if e.get("npc") else e["actor"]
+                click.echo(f"     - {e['name']}: event {e['event']} on {who} — {len(blocks)} block"
+                           f"{'s' if len(blocks) != 1 else ''} ({new_blocks} new), {n_lines} line"
+                           f"{'s' if n_lines != 1 else ''}")
+                for ln in en:
+                    if ln.get("grew"):
+                        for k, text in enumerate(ln.get("to") or []):
+                            click.echo(f"         line {ln['grew'][0] + k} (new): {_short(text)}")
+                    else:
+                        click.echo(f"         line {ln['id']}: {_short(ln['from'])} -> {_short(ln['to'])}")
+            for pl in r.get("placements") or []:
+                occ = pl.get("occupied_by")
+                note = f"   (occupied by {occ})" if occ else ""
+                click.echo(f"     - camera scene: file_id {pl['file_id']} -> {pl['target_dat']}{note}")
+                if occ:
+                    collisions += 1
+            for cam in r.get("dropped") or []:
+                click.echo(f"     - camera scene {cam['file_id']} ({cam['dat']}) is no longer used: removed")
+            for w in r.get("warnings") or []:
+                click.echo(click.style(f"     ⚠ {w}", fg="yellow"))
+            if r.get("server"):
+                click.echo(f"     server (proposed, not run): {r['server']}")
+            if r.get("sql"):
+                for line in r["sql"].splitlines():
+                    click.echo(f"       {line}")
+            if r.get("lua_file"):
+                click.echo(f"     server scripts (proposed): {r['lua_file']}")
+            elif r.get("lua"):
+                for line in r["lua"].splitlines():
+                    click.echo(f"       {line}")
+        elif kind == "zone_dialog":
+            recs = r.get("records") or []
+            where = ", ".join(r.get("files") or []) or "no DAT changes"
+            click.echo(f"{head}: zone {r.get('zone')}, {len(recs)} line{'s' if len(recs) != 1 else ''} -> {where}")
+            for e in recs:
+                if e.get("created"):
+                    click.echo(f"     - line {e['id']} [{e['lang']}] {e['dat']}  (new): {_short(e['to'])}")
+                else:
+                    click.echo(f"     - line {e['id']} [{e['lang']}] {e['dat']}: {_short(e['from'])} -> "
+                               f"{_short(e['to'])}")
+            for w in r.get("warnings") or []:
+                click.echo(click.style(f"     ⚠ {w}", fg="yellow"))
+        elif kind == "copy":
+            note = {"unchanged": "  (already the same)",
+                    "source": "  (the source itself: building into the folder it lives in)"}.get(r.get("state"), "")
+            click.echo(f"{head}: {r.get('source')} -> {r.get('path')} ({r.get('bytes'):,} bytes){note}")
+            if r.get("file_id") is not None:
+                occ = f"   (occupied by {r['occupied_by']})" if r.get("occupied_by") else ""
+                click.echo(f"     - file_id {r['file_id']} -> {r['path']}{occ}")
+                if occ:
+                    collisions += 1
+        elif kind == "ability":
+            files = r.get("placements", [])
+            click.echo(f"{head}: {r.get('kind')} animation {r.get('animation')} "
+                       f"— {len(files)} DAT{'s' if len(files) != 1 else ''}")
+            for w in r.get("warnings") or []:
+                click.echo(click.style(f"     ⚠ {w}", fg="yellow"))
+            for p in files:
+                who = f"{p.get('race') or 'all races'} {p['role']}"
+                occ = p.get("occupied_by")
+                ph = p.get("placeholder")
+                mark = "⚠ " if occ else ""
+                note = (f"   (occupied by {occ})" if occ
+                        else f"   (retail placeholder {ph}, free)" if ph else "")
+                click.echo(f"     - {mark}file_id {p['file_id']:>6}  {who:<26} -> {p['dat']}{note}")
+                if occ:
+                    collisions += 1
+            if r.get("folder"):
+                holds = ["the server SQL"] if r.get("server") else []
+                holds += [f"a copy of {'each' if len(files) != 1 else 'the'} DAT", "placements.json"]
+                click.echo(f"     folder: {r['folder']}  ({', '.join(holds)})")
+            if r.get("server"):
+                click.echo(f"     server: {r['server']}")
+            if r.get("sql"):
+                for line in r["sql"].splitlines():
+                    click.echo(f"       {line}")
+            # The server pass (design2 §1.2): one line per step, then its warnings. The
+            # model viewer parses these lines; keep their form.
+            sp = r.get("server_pass") or {}
+            for key in ("db", "menu", "lua"):
+                step = sp.get(key)
+                if step is not None:
+                    click.echo(f"     {step.line(key)}")
+            for key in ("db", "menu", "lua"):
+                step = sp.get(key)
+                for w in (step.warnings if step is not None else []):
+                    click.echo(click.style(f"     ⚠ {key}: {w}", fg="yellow"))
         else:
             src = r.get("source")
             size = f", {r['bytes']:,} B" if r.get("bytes") else ""
@@ -1948,11 +3949,20 @@ def _ask(header: str, enter_label: str = "Enter value", **prompt_kwargs):
 
 
 def _existing_project_names() -> list[str]:
-    """Names of existing dats projects — the `dats/*.json` manifest stems."""
+    """Names of existing dats projects — the `projects/*.json` manifest stems."""
     d = Path("projects")
     if not d.is_dir():
         return []
-    return sorted({p.stem for p in d.glob("*.json")})
+    return sorted({p.stem for p in d.glob("*.json") if not _is_include_file(p)})
+
+
+def _is_include_file(path: Path) -> bool:
+    """An include file or a build list: under projects/ but not a project."""
+    from xi.dats.xi_build_list import LIST_SCHEMA
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("schema") in (INCLUDE_SCHEMA, LIST_SCHEMA)
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def _prompt_project_name() -> str:
@@ -2558,6 +4568,35 @@ def _wizard_mount(slug: str, project: str, prev: dict | None = None) -> dict:
     }
 
 
+def _wizard_copy(slug: str, prev: dict | None, manifest_path: Path) -> dict:
+    """A copy action: the file to put in as it is, and where in the game folder it goes."""
+    from xi.dats import xi_copy as CP
+    p = prev or {}
+    prev_file = (p.get("resources") or {}).get("file")
+    if prev_file:
+        try:
+            prev_file = str(_resolve_raw_source(prev_file, manifest_path, _read_manifest(manifest_path)))
+        except click.ClickException:
+            pass
+    src = _prompt_existing_dat("Which file goes in as it is? (a DAT, a .bgw track …)", default=prev_file)
+    default = (p.get("target") or {}).get("path") or CP.guess_target(src)
+    while True:
+        path = CP.rel_path(_ask("Where in the game folder does it go? (e.g. ROM/119/51.DAT)",
+                                "Enter path", default=default))
+        if path:
+            break
+        click.echo("  A path inside the game folder, like ROM/119/51.DAT or sound9/win/music/data/music067.bgw.")
+    target: dict = {"path": path}
+    if re.match(r"^ROM[0-9]*/[0-9]+/[0-9]+\.DAT$", path, re.I):
+        prev_fid = (p.get("target") or {}).get("file_id")
+        raw = _ask("File id to register at that path? (blank: none — the client already reads the path)",
+                   "Enter file id", default=str(prev_fid) if prev_fid is not None else "", show_default=False)
+        if str(raw).strip():
+            target["file_id"] = int(raw)
+    return {"id": f"copy.{slug}", "type": "copy", "target": target,
+            "resources": {"file": _file_ref(src, manifest_path)}}
+
+
 def _wizard_entity(slug: str, prev: dict | None = None) -> dict:
     p = prev or {}
     src = _prompt_existing_dat("Select your .DAT file",
@@ -2781,7 +4820,7 @@ def _prompt_look() -> dict | None:
 
 def _wizard_npc(slug: str, prev: dict | None = None) -> dict:
     """Collect an NPC costume (race + gender + face + gear + weapons), BAKE it into a
-    single self-contained entity DAT at ``dats/custom/<slug>.dat``, then fall into the
+    single self-contained entity DAT at ``projects/custom/<slug>.dat``, then fall into the
     entity flow (dest ROM path + model id) with that baked DAT as the source. The build
     step then places it verbatim like any other entity. See [[custom-npc-feature]]."""
     from xi.entity.xi_bake_npc import (
@@ -2981,20 +5020,21 @@ def _expansion_report(entries: int) -> list[tuple[str, str, bool, str]]:
     return out
 
 
-def _check_targets_ready() -> dict[str, bool]:
-    """First step of the wizard: verify the base install's FTABLE and whether it's
-    expanded for mounts / entity / gear (with sizes). Aborts when there's no FTABLE
-    at all (nothing could register file_ids); otherwise returns per-type readiness
-    so the wizard can refuse a type whose tables/DLL aren't ready — instead of
-    collecting every answer and only failing at build time. Builds patch this
-    table directly (no seeding)."""
-    root = _target_root("dir")
+def _check_targets_ready(target: str = "dir") -> dict[str, bool]:
+    """First step of the wizard: verify the build target's FTABLE (the base install,
+    or FFXI_PIVOT_DIR for `--pivot`) and whether it's expanded for mounts / entity /
+    gear (with sizes). Aborts when there's no FTABLE at all (nothing could register
+    file_ids); otherwise returns per-type readiness so the wizard can refuse a type
+    whose tables/DLL aren't ready — instead of collecting every answer and only
+    failing at build time. Builds patch this table directly (no seeding)."""
+    root = _target_root(target)
+    setting = "FFXI_PIVOT_DIR" if target == "pivot" else "FFXI_DIR"
     entries = _ftable_entries(root / "FTABLE.DAT")
-    click.echo(f"\nBase install (FFXI_DIR): {root}")
+    click.echo(f"\n{_TARGET_LABELS[target]} ({setting}): {root}")
     if entries == 0:
         raise click.ClickException(
             f"No FTABLE.DAT in {root} — builds register file_ids there, so nothing "
-            "can be built. Check FFXI_DIR points at the game install, then re-run "
+            f"can be built. Check {setting} points at the right folder, then re-run "
             "`xi dats new`.")
     from xi.ftable.xi_expand import RETAIL_ENTRIES
     if entries > RETAIL_ENTRIES:
@@ -3018,18 +5058,20 @@ def _check_targets_ready() -> dict[str, bool]:
 
 @group.command("new")
 @click.option("--project", default=None,
-              help="Skip the name prompt — writes to dats/<project>.json.")
-def new_cmd(project: str | None):
+              help="Skip the name prompt — writes to projects/<project>.json.")
+@click.option("--pivot", is_flag=True, default=False,
+              help="Check and build into FFXI_PIVOT_DIR instead of the base install (FFXI_DIR).")
+def new_cmd(project: str | None, pivot: bool = False):
     """Interactively inject prebuilt DAT(s) at new model ids.
 
     A wizard for the "I already have the DATs, just place them at new model ids"
     case: no `mesh export` / GLB rebuild. Asks for the content type (gear /
     mount / entity), collects the source DAT(s), destination, and model id(s),
-    writes a `dats/<project>.json` manifest action, then offers to build it.
+    writes a `projects/<project>.json` manifest action, then offers to build it.
     """
     click.echo("\nWelcome to the Dat Modification wizard")
     _rule()
-    ready = _check_targets_ready()
+    ready = _check_targets_ready("pivot" if pivot else "dir")
     _rule()
     project = project or _prompt_project_name()
     slug = _project_slug(project)
@@ -3043,22 +5085,37 @@ def new_cmd(project: str | None):
         "Entity (NPC / Monster / Object)": "entity",
         "NPC (costume: race + gear + weapons)": "npc",
         "Ability (recipe from the Ability Mixer / xi ability recipe)": "ability",
+        "Spell menu record (a new spell id: name, help, MP, levels)": "spell",
+        "Command menu record (a new job ability / weapon skill id)": "command",
+        "Database records (edit or add items, key items, titles, …)": "database",
+        "Zone dialog (edit or add the lines a zone's NPCs say)": "zone_dialog",
+        "Zone NPCs (rename or add a zone's NPCs)": "zone_npcs",
+        "Zone events (cutscenes and dialogue on a zone's NPCs)": "zone_events",
+        "Copy a file as it is (a redrawn UI sheet, a music track …)": "copy",
     }[_choose("What type of content is being added?",
               ["Gear", "Mounts", "Entity (NPC / Monster / Object)",
                "NPC (costume: race + gear + weapons)",
-               "Ability (recipe from the Ability Mixer / xi ability recipe)"])]
+               "Ability (recipe from the Ability Mixer / xi ability recipe)",
+               "Spell menu record (a new spell id: name, help, MP, levels)",
+               "Command menu record (a new job ability / weapon skill id)",
+               "Database records (edit or add items, key items, titles, …)",
+               "Zone dialog (edit or add the lines a zone's NPCs say)",
+               "Zone NPCs (rename or add a zone's NPCs)",
+               "Zone events (cutscenes and dialogue on a zone's NPCs)",
+               "Copy a file as it is (a redrawn UI sheet, a music track …)"])]
     # The baked NPC is placed at a custom entity model id, so it needs the entity tables.
     # Abilities take retail-range ids (job-ability / spell bands, weapon-skill dummies),
     # so the tables need no expansion.
     ready_key = "entity" if ctype == "npc" else ctype
-    if ctype != "ability" and not ready.get(ready_key, True):
+    if ctype not in ("ability", "copy", *RESTORABLE_TYPES, *RECORD_TYPES) \
+            and not ready.get(ready_key, True):
         hint = {"gear": "Run `xi ftable expand gear` (expands the FTABLE and patches "
                         "FFXiMain.dll)",
                 "entity": "Run `xi ftable expand entity`",
                 "mount": "The FTABLE is smaller than retail — check the install"}[ready_key]
         raise click.ClickException(
-            f"The base install isn't ready for {ctype} content (see the report above). "
-            f"{hint}, then re-run `xi dats new`.")
+            f"The {'pivot folder' if pivot else 'base install'} isn't ready for {ctype} content "
+            f"(see the report above). {hint}, then re-run `xi dats new`.")
     # If this project already has action(s) of the chosen type, use them to
     # default the prompts (slot, model id, paths, …) so re-running just tweaks.
     if ctype == "gear":
@@ -3083,17 +5140,30 @@ def new_cmd(project: str | None):
             new_actions = [_wizard_npc(slug, prev)]
         elif ctype == "ability":
             new_actions = [_wizard_ability(slug, prev, manifest_path, manifest)]
+        elif ctype in RECORD_TYPES:
+            new_actions = [_wizard_record(ctype, slug, prev, manifest_path, manifest)]
+        elif ctype == "database":
+            new_actions = [_wizard_database(slug, prev, pivot)]
+        elif ctype == "zone_dialog":
+            new_actions = [_wizard_zone_dialog(slug, prev, pivot)]
+        elif ctype == "zone_npcs":
+            new_actions = [_wizard_zone_npcs(slug, prev, pivot)]
+        elif ctype == "zone_events":
+            new_actions = [_wizard_zone_events(slug, prev, pivot)]
+        elif ctype == "copy":
+            new_actions = [_wizard_copy(slug, prev, manifest_path)]
         else:
             new_actions = [_wizard_entity(slug, prev)]
 
     by_id = {a.get("id"): a for a in manifest.get("actions", [])}
     for action in new_actions:
-        if action.get("type") == "ability":
-            continue   # allocated by the build (animation number + per-race placements)
-        action["result"] = _plan_result(action)  # record the allocation inline (same as build)
+        if action.get("type") not in ("ability", *RESTORABLE_TYPES, *RECORD_TYPES):
+            # Allocated deterministically from the definition; abilities and menu
+            # records are decided by the build against the live tables instead.
+            action["result"] = _plan_result(action)  # record the allocation inline (same as build)
         prior_targets = ((by_id.get(action["id"]) or {}).get("result") or {}).get("targets")
         if prior_targets:  # keep the record of where it was last built into
-            action["result"]["targets"] = prior_targets
+            action.setdefault("result", {})["targets"] = prior_targets
         _add_or_replace_action(manifest, action, replace=True)
     _write_manifest(manifest_path, manifest)
     _rule()
@@ -3102,6 +5172,6 @@ def new_cmd(project: str | None):
 
     if click.confirm("\n>> Would you like to build this project now?", default=True):
         _rule()
-        click.get_current_context().invoke(build_cmd, project=slug)
+        click.get_current_context().invoke(build_cmd, project=slug, pivot=pivot)
     else:
-        click.echo(f"Run it later with:  xi dats build --project {slug}")
+        click.echo(f"Run it later with:  xi dats build --project {slug}" + (" --pivot" if pivot else ""))

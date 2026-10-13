@@ -138,6 +138,34 @@ all races, and the model viewer's base list, which labels `ROM/204/17`
 old guess with no better provenance. Both labels are unverified as a retail
 semantic join.
 
+### The custom band (cexislots) and its 1-based race term
+
+Above both retail banks sits a **custom band** the `cexislots` plugin adds so
+weapon-skill numbers past retail's range resolve to published DATs (default
+first number 272, base file id 431344; both configurable, `FX_WS_BAND_*` in
+`xi_config`). Its ids are flat, grouped by number so raising the reserved count
+moves nothing already published:
+
+```text
+file_id = WS_BASE + (number - FX_WS_BAND_FIRST) * 24 + block * 8 + race
+          block 0 = body, 1 = companion A (body + 8), 2 = companion B (body + 16)
+          24 ids per number: 8 body, 8 companion A, 8 companion B
+```
+
+**`race` is 1-based** — the client's `RaceGenderConfig` number 1..8 (Hume male
+is 1, Galka 8), the same index the retail loader rejects at 9 and above. The
+retail banks hide this behind a table pointer that is pre-offset so `table[1]`
+is the first race; the flat custom arithmetic adds the number straight, so the
+placement must use `ri + 1` (`weapon_skill_slot` in `xi_motion_tables.py`).
+`cexislots::fxWeaponSkillBank` reads the client's register directly and is
+already correct — so a mismatch is fixed on the xi-tools side, not the plugin.
+Placing races 0-based made every race resolve one id too low: a Hume male
+weapon skill opened Hume female's body DAT (432401 instead of 432400) and the
+wrong race's clips on the skeleton stretched the model in game (found
+2026-09-20 from a Process Monitor capture of the client's `ReadFile`, not from
+the DATs, which were each individually correct). Diagnose any "custom WS loads
+wrong / model stretched" report from the file the client **opens**.
+
 ## 3. What the retail DATs reveal
 
 ### `ROM/181/72.DAT` — ability / weapon-skill names
@@ -194,7 +222,33 @@ Most melee weapon-skill DATs carry a four-character effect directory such as
 | 04 | Scythe | 96 | | 10 | Katana | 128 |
 | 05 | Club | 160 | | 11 | Great katana | 144 |
 
-`first_id + ordinal - 1` gives 180 candidates, 174 agreeing with the
+**By animation number.** The two characters are the skill's 15-slot block of the
+animation table, `FF = (anim − 1) div 15` (00 Sword for animations 1–15 … 11 Great katana
+for 166–180), and the ordinal is its position in the block, `1`–`9` then `a`–`f`; skills
+added later took the next free position of their home family, `g`, `h`, `i`. So for a
+skill in its home slot, anim = 15 × FF + position — 172 of 172 such folders on Hume
+female — and the name is the same on every race:
+
+| Folder | Animation | Skill | Hume female DAT (file id) |
+| --- | ---: | --- | --- |
+| `1111` | 166 = 15 × 11 + 1 | Tachi: Enpi | `ROM/101/76` (34161) |
+| `11d1` | 178 = 15 × 11 + 13 | Tachi: Fudo | `ROM/255/65` (34173) |
+| `11e1` | 179 = 15 × 11 + 14 | Tachi: Shoha | `ROM/268/76` (34174) |
+
+The later additions sit outside their home slot: 75 `05g1` Exudation, 230 `00g1`
+Sanguine Blade, 231 `09e1` Cataclysm, 233 `00h1` Chant du Cygne, 236 `02g1` Rudra's
+Storm, 237 `00i1` Requiescat, 238 `02h1` Exenterator, 239 `09g1` Shattersoul.
+
+The name is **not hex**, and not a file id, animation number or skill id either: `11d1`
+and `11e1` read as 0x11D1 and 0x11E1 (4561, 4577) are 16 apart only because `d` and `e`
+are neighbouring positions, and real names use `g`, `h` and `i`. **The client never reads
+it**: the weapon skill's `main` is found by type and name across every file attached to
+the actor (PS2 decompile, `ReverseFindRes(actor, 7, 'main')` in `xicontrolactor.cpp`), and
+its clips and weapon traces the same way; no lookup on the weapon-skill path goes by
+folder name. A custom weapon skill's effect folder can be called anything —
+`xi ability compose` uses the recipe's `dir` ([../ability/mixer.md](../ability/mixer.md#folders)).
+
+**By skill id.** `first_id + ordinal - 1` gives 180 candidates, 174 agreeing with the
 catalogue (1,440/1,440 directories present across the eight races). Examples:
 `0011` → 32 Fast Blade (anim 1, `ROM/76/30`); `0111` → 1 Combo (anim 16,
 `ROM/76/39`); `02g1` → 31 Rudra's Storm (anim 236, `ROM/257/78`); `05g1` →
@@ -210,6 +264,38 @@ one-to-one inversion (Fast Blade / Fast Blade II, Final Heaven / Final
 Paradise, Knights of Round / Rotund, Tachi: Kaiten / Suikawari share DATs).
 Use the pattern to propose and check names, never to assert them for hidden
 or extended slots.
+
+### The folders of a body DAT
+
+Most primary-bank body DATs (432 of 568 slots scanned) are a race root holding the
+effect folder and a clip folder named like the root; the rest are placeholders, ranged
+skills with an effect folder only, or named families (`bash`, `jump`, `nusu` …) in the
+same shape. Tachi: Enpi for Hume female (`ROM/101/76`):
+
+```text
+hf_1/     payload 00000000 …   race root
+  1111/   payload 00000020 …   effect folder: generators, routines (main …), curves,
+                               meshes, textures, sprite sheets, sound pointers
+  (end)
+  hf_1/   payload 00000000 …   clip folder: clips (c300 c301 …), then weapon traces
+  (end)                        (c3a0 c4a0)
+(end)
+```
+
+- The root is `<race tag>_<c>`: the tag is `hm`, `hf`, `em`, `ef`, `tr` (both Tarutaru
+  load one file; there is no `tm` or `tf`), `mt` or `gl`, and `c` is the effect folder's
+  first character, lowercased (`hf_0` around `0011`, `hf_1` around `1111`, `hf_e` around
+  `enst`; the `nusu` / `suru` files use `hf_s`).
+- Retail puts the two folders in either order (Fast Blade's clip folder comes first), and
+  a few DATs keep their weapon traces directly under the root.
+- The two waist companions hold one folder of the root's name with the part-2 clips
+  (`[hm_0] {b002 b012 b022}`, `ROM/76/124`), or retail's 160-byte `[dumm]` placeholder
+  (slot 0's companions, byte for byte the same file on every race).
+- The client reads the high nibble of a folder payload's byte 3 ([../fx/effect_system.md](../fx/effect_system.md)
+  §1), and retail varies it. Across the 1,475 distinct bodies in this shape (all races, slots 0–271),
+  the effect folder is mostly 2 (`00000020`, 1,022) and otherwise 0xA (`000000a0`, 452; Tachi: Shoha's
+  `11e1`, `ROM/268/76`). The root is 0 or 0xA (1,099 / 375). The clip folder is 0, with 0xA on 46.
+  Compose writes 2, 0 and 0, the commonest values. The folder names themselves are never looked up (above).
 
 ## 4. Corpus evidence and its limits
 

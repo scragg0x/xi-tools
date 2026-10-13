@@ -933,8 +933,10 @@ def encode_png_to_texture_section(section_id: str, tex_name: str, png_path: Path
                                   force_format: Optional[str] = None,
                                   max_size: Optional[int] = None,
                                   alpha_scale: float = 1.0,
-                                  force_opaque: bool = False) -> Optional[bytes]:
-    """PNG -> DXT (via texconv) -> 0x20 texture section. Returns None on failure.
+                                  force_opaque: bool = False,
+                                  raise_errors: bool = False) -> Optional[bytes]:
+    """PNG -> DXT (via texconv) -> 0x20 texture section. Returns None on failure
+    (raise_errors re-raises texconv's own error instead, so a caller can report why).
 
     The game only reads DXT1 (1TXD) and DXT3 (3TXD) — NOT DXT5 — so we force
     DXT3 when the PNG has an alpha channel (the engine alpha-tests entity meshes,
@@ -957,6 +959,8 @@ def encode_png_to_texture_section(section_id: str, tex_name: str, png_path: Path
     try:
         convert_png_to_dds(png_path, dds_path, requested_format=fmt)
     except (FileNotFoundError, RuntimeError, ValueError):
+        if raise_errors:
+            raise
         return None
     info = parse_dds_info(dds_path)
     dxt1 = info.fourcc == "DXT1"
@@ -1233,9 +1237,11 @@ def format_comparison(before: dict, after: dict) -> str:
     return "\n".join(lines)
 
 
-def default_model_path(dat_path: Path) -> Optional[Path]:
-    """The model exported for this DAT, if present: exports/mesh/<rom>/<stem>.{fbx,glb,gltf}."""
-    for out_dir in (default_output_dir(dat_path), _legacy_default_output_dir(dat_path)):
+def default_model_path(dat_path: Path, source_dir: Optional[Path] = None) -> Optional[Path]:
+    """The model exported for this DAT, if present: exports/mesh/<rom>/<stem>.{fbx,glb,gltf},
+    or the same name in ``source_dir`` when one is given."""
+    dirs = (source_dir,) if source_dir else (default_output_dir(dat_path), _legacy_default_output_dir(dat_path))
+    for out_dir in dirs:
         for ext in (".fbx", ".glb", ".gltf"):
             candidate = out_dir / f"{dat_path.stem}{ext}"
             if candidate.is_file():
@@ -1510,6 +1516,8 @@ import click as _click  # noqa: E402
 @_click.command('import')
 @_click.argument('dat_path')
 @_click.argument('model_path', required=False, type=_click.Path(exists=True, path_type=Path))
+@_click.option('--source-dir', type=_click.Path(exists=True, file_okay=False, path_type=Path), default=None,
+               help='Look for the model (<stem>.fbx/.glb/.gltf) in this folder instead of exports/mesh/<rom>/.')
 @_click.option('--mesh-name', default=None, help="4-char section name (default: reuse the DAT's first mesh section)")
 @_click.option('--double-sided/--single-sided', default=True, show_default=True,
                help='Emit reversed back-faces so thin surfaces (flags/cloth) are not culled')
@@ -1527,13 +1535,13 @@ import click as _click  # noqa: E402
 @_click.option('--tex-local', 'tex_local', is_flag=True, default=False,
                help='Texture-only import sourcing images from files next to the model '
                     '(matched by name; the glTF is only a naming reference). Implies --tex.')
-def cmd(dat_path: str, model_path, mesh_name, double_sided: bool, scale: float, rotate_y: float, flip_yz, tex_only: bool, tex_local: bool):
+def cmd(dat_path: str, model_path, source_dir, mesh_name, double_sided: bool, scale: float, rotate_y: float, flip_yz, tex_only: bool, tex_local: bool):
     """Import an edited mesh (.fbx/.gltf/.glb) back into an FFXI DAT.
 
     DAT_PATH may be a filesystem path or a ROM-relative spec like ROM/7/97.
     MODEL_PATH is optional — if omitted, the model exported for this DAT
-    (exports/mesh/<rom>/<stem>.fbx, then .glb/.gltf) is used automatically.
-    Replaces the DAT's skeleton-mesh section(s) with the edited geometry,
+    (exports/mesh/<rom>/<stem>.fbx, then .glb/.gltf) is used automatically;
+    --source-dir looks for it in another folder. Replaces the DAT's skeleton-mesh section(s) with the edited geometry,
     re-skinned to the DAT's existing skeleton (auto-scaled to match it). A
     <dat>.base backup is kept and used as the source on every run.
 
@@ -1546,10 +1554,10 @@ def cmd(dat_path: str, model_path, mesh_name, double_sided: bool, scale: float, 
     except FileNotFoundError as e:
         raise _click.ClickException(str(e))
     if model_path is None:
-        model_path = default_model_path(resolved)
+        model_path = default_model_path(resolved, source_dir)
         if model_path is None:
             raise _click.ClickException(
-                f"No model given and none found at {default_output_dir(resolved)}. "
+                f"No model given and none found at {source_dir or default_output_dir(resolved)}. "
                 f"Export first, or pass a model path."
             )
         _click.echo(f"Using model:    {model_path}")

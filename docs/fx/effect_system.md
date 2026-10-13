@@ -64,10 +64,11 @@ byte offset.
 0x04  4   meta         type = meta & 0x7F ; size = ((meta >> 7) & size_mask) * 0x10
 0x08  8   padding      (zeros) — data starts at section + 0x10
 ```
-**Size field is 19 bits** (`size_mask = 0x7FFFF` on write — bits 7–25). Writers must
-use that mask (`xi.common.xi_section`); overflowing into bit 26 corrupts `is_shadow`
-and the client reads the section 8 MiB short. Some readers still accept a wider mask
-under the 8 MiB ceiling. `dataStart = sectionStart + 0x10`; next section at
+**Size field is 19 bits** (`size_mask = 0x7FFFF`, bits 7–25), as the client reads it.
+Readers and writers use that mask (`xi.common.xi_section`); overflowing into bit 26
+corrupts `is_shadow` and the client reads the section 8 MiB short, and a reader with a
+wider mask (xim's 20 bits) reads a section with `is_shadow` set as 8 MiB too long.
+`dataStart = sectionStart + 0x10`; next section at
 `sectionStart + size` (no gaps). xim: `DatParser.kt:128-160`.
 
 ### Section types
@@ -82,6 +83,12 @@ Texture, `0x21` SpriteSheetMesh, `0x25` WeightedMesh, `0x2B` SkeletonAnimation,
 - A `Directory` (`0x01`) **pushes** a new scope; an `End` (`0x00`) **pops** back to
   the parent. Sections in between are that directory's children.
 - Effect DATs commonly nest `root → "data" → "effe"` (effects) and `"mode"` (models).
+- A directory's 16-byte payload follows its header, and the client reads the high nibble of
+  payload byte 3: `00 00 00 20 …` (2) on an effect folder — a job ability's or spell's root
+  (`ROM/10/11` `care`, `ROM/15/89` `bers`) or a weapon skill's `0011` / `1111`, though about a third of
+  retail weapon-skill effect folders carry 0xA instead (`11e1` in `ROM/268/76`) — and 0 or 0xA on a
+  weapon skill's race root (about a quarter 0xA) and 0 on its clip folder (0xA on about 3%) (PS2 decompile
+  `YmResourceFile::Init`, where it is a texture-memory mode; what the PC client does with it is not known).
 - Resolution of a `DatId` reference: **local directory first, then up the parent
   chain, then the global registry** (`DatResource.kt:433-459`, `TextureLink.kt`).
 
@@ -134,9 +141,33 @@ TargetFlag  : Self0x01 Player0x02 Party0x04 Ally0x08 Npc0x10 Enemy0x20 Corpse0x8
 ```
 
 ### Cast-motion FourCCs
-The "charging" animation is picked by MagicType — id = `"ca" + suffix`
-(`DatResource.kt:130-152`): `wh bk sm nj so bl ge fa` → e.g. White Magic = **`cawh`**,
-Ninjutsu = `canj`, Trust = `cafa`. (Spell-stop uses the `sp…` family.)
+The "charging" routine (the chant clip plus the casting circle) is **chosen by the server**,
+not by the client's spell data. When a cast starts, the server's cast-start action carries
+one 4-character routine id, picked from the spell's `spell_list.group` alone
+(LandSandBoat: `CMagicState::CMagicState` in `src/map/ai/states/magic_state.cpp` sends
+`CSpell::getFourCC()` from `src/map/spell.cpp`; the ids are in `src/map/enums/four_cc.h`):
+
+| `group` | 1 song | 2 black | 3 blue | 4 ninjutsu | 5 summoning | 6 white | 7 geomancy | 8 trust |
+|---|---|---|---|---|---|---|---|---|
+| cast start | `caso` | `cabk` | `cabl` | `canj` | `casm` | `cawh` | `cage` | `cafa` |
+| interrupted | `spso` | `spbk` | `spbl` | `spnj` | `spsm` | `spwh` | `spge` | `spfa` |
+
+Group 0, or any other value, sends `spwh`. The caster's job plays no part (any Fire chants
+`cabk`, whoever casts it). The client plays the routine it is sent from the caster's race
+files, then the system file; the spell DAT is not loaded until the cast finishes, and once
+it has loaded the client runs the chant's `st<xx>` partner (which stops the circle) and the
+DAT's `main` (PS2 decompile: `RecvBattleCalc2`, `SetCastMagicID`, `FireMagic`). So a
+spell's chant changes only with its `group`
+(which also picks its script folder and feeds cast time, MP cost and recast), with the
+`ca<xx>` routine edited in every race's files (every spell of that group), or with a server
+change to what it sends.
+
+xim (`DatResource.kt:130-152`) picks the routine from the client's `SpellInfo` magicType
+instead (`wh bk sm nj so bl ge fa` in the MagicType order above). For a retail spell whose
+record and server row agree that is the same family, but the game follows the server: a
+spell whose `spell_list.group` says otherwise chants what the group says. The two lists
+also number differently (magicType White 1 … Trust 8 in the order above, `group` as in the
+table), agreeing only at 2, 4, 7 and 8, so a value cannot be copied from one to the other.
 
 ---
 

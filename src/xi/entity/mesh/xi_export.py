@@ -225,9 +225,12 @@ def decode_dxt3(reader: Reader, width: int, height: int) -> bytes:
     buffer = bytearray(width * height * 4)
     for y1 in range(0, height, 4):
         for x1 in range(0, width, 4):
+            # Standard DXT3 alpha: 64-bit little-endian, texel i (row-major in the
+            # block) is nibble i. xim's (a0 << 32) | a1 swapped rows 0<->1 and
+            # 2<->3, streaking every texture whose alpha carries the image.
             a0 = reader.u32()
             a1 = reader.u32()
-            alpha = (a0 << 32) | a1
+            alpha = a0 | (a1 << 32)
             c0 = reader.u16()
             c1 = reader.u16()
             r = [0, 0, 0, 0]
@@ -245,8 +248,9 @@ def decode_dxt3(reader: Reader, width: int, height: int) -> bytes:
             for y in range(y1, y1 + 4):
                 for x in range(x1 + 3, x1 - 1, -1):
                     idx = (indices >> (2 * count)) & 0x3
-                    pixel_alpha = ((alpha >> (4 * count)) & 0xF) * 255 // 16
                     count -= 1
+                    i = (y - y1) * 4 + (x - x1)
+                    pixel_alpha = ((alpha >> (4 * i)) & 0xF) * 255 // 16
                     if y >= height or x >= width:
                         continue
                     dest = 4 * y * width + 4 * x
@@ -847,7 +851,9 @@ def _inject_fbx_textures(fbx_path: Path, tex_dir: Path) -> None:
     fbx_path.write_bytes(bytes(data))
 
 
-def convert_glb_to_fbx(glb_path: Path, bake_anim: bool = False) -> Path:
+def convert_glb_to_fbx(glb_path: Path, bake_anim: bool = False,
+                       merge_distance: float = 0.0, linear_colors: bool = False,
+                       opaque_twins: bool = True) -> Path:
     """Convert a .glb to an FBX via headless Blender.
 
     The Blender script rewires packed GLB images to the loose PNG files that
@@ -857,7 +863,45 @@ def convert_glb_to_fbx(glb_path: Path, bake_anim: bool = False) -> Path:
 
     ``bake_anim`` carries a GLB that embeds skeletal clips (a full-animation pose export)
     through to the FBX; a plain mesh export has none, so it stays off by default.
+
+    ``merge_distance`` > 0 merges coincident vertices in Blender before export
+    (mesh merge-by-distance), fusing the UV-seam splits a glTF forces while
+    keeping the per-corner UVs — used by ``zone export --weld-seams``. FBX stores
+    UVs per polygon-vertex, so this connects the topology without smearing the
+    texture the way collapsing UVs in the GLB would.
+
+    ``linear_colors`` writes vertex colours to the FBX untouched instead of Blender's
+    default sRGB encode (neutral 0.5 -> ~0.73) — ``zone export --vertex-color raw``.
+
+    ``opaque_twins=False`` points OPAQUE materials at the texture's own PNG instead of
+    a 24-bit ``<tex>_opaque.png`` twin — ``zone export --unreal``, whose materials
+    decide alpha themselves. Keep the twins for anything reopened in Blender: its FBX
+    importer wires a PNG's alpha into the material whenever the file has one.
     """
+    return _run_glb_to_fbx(glb_path, bake_anim, merge_distance, linear_colors, False,
+                           opaque_twins)[0]
+
+
+def convert_glb_to_fbx_zeroed(glb_path: Path, bake_anim: bool = False,
+                              merge_distance: float = 0.0, linear_colors: bool = False,
+                              opaque_twins: bool = True,
+                              ) -> Tuple[Path, Tuple[float, float, float]]:
+    """:func:`convert_glb_to_fbx` for ``--zero-coords``: every object in the FBX sits at
+    location 0, rotation 0, scale 1 with its transform baked into the data, and an
+    unrigged file is moved so the centre of its base is on the origin (see
+    ``xi_glb_to_fbx._zero_coords``). Returns the FBX and that offset in Blender's frame
+    (Z-up, FFXI units): placing the imported FBX at the offset puts it back."""
+    fbx_path, stdout = _run_glb_to_fbx(glb_path, bake_anim, merge_distance, linear_colors, True,
+                                       opaque_twins)
+    m = re.search(r"^XI_ZERO_OFFSET (\S+) (\S+) (\S+)\s*$", stdout, re.MULTILINE)
+    if not m:
+        raise ValueError(f"Blender did not report the --zero-coords offset for {fbx_path.name}")
+    return fbx_path, (float(m[1]), float(m[2]), float(m[3]))
+
+
+def _run_glb_to_fbx(glb_path: Path, bake_anim: bool, merge_distance: float,
+                    linear_colors: bool, zero_coords: bool,
+                    opaque_twins: bool = True) -> Tuple[Path, str]:
     blender = Path(BLENDER_PATH)
     if not blender.is_file():
         raise ValueError(
@@ -868,14 +912,57 @@ def convert_glb_to_fbx(glb_path: Path, bake_anim: bool = False) -> Path:
     tex_dir = str(glb_path.parent.resolve())
     completed = subprocess.run(
         [str(blender), "-b", "--python", str(_GLB_TO_FBX_SCRIPT),
-         "--", str(glb_path), str(fbx_path), tex_dir, "1" if bake_anim else "0"],
+         "--", str(glb_path), str(fbx_path), tex_dir, "1" if bake_anim else "0",
+         repr(float(merge_distance)), "0", "45.0", "0.0", "4",  # argv 5-8: alpha split off
+         "LINEAR" if linear_colors else "SRGB", "1" if zero_coords else "0",
+         "1" if opaque_twins else "0"],
         capture_output=True,
         text=True,
     )
     if completed.returncode != 0 or not fbx_path.is_file():
         detail = (completed.stderr or completed.stdout or "blender produced no output").strip()
         raise ValueError(f"Blender glb->fbx conversion failed:\n{detail}")
-    return fbx_path
+    return fbx_path, completed.stdout or ""
+
+
+def convert_glb_to_fbx_alpha_split(glb_path: Path, decal_offset: float = 0.00001,
+                                   smooth_angle: float = 45.0,
+                                   weld_dp: int = 4, linear_colors: bool = False,
+                                   opaque_twins: bool = True) -> List[Path]:
+    """"(Test) Alpha Split Mesh" — convert a zone ``.glb`` to **two** FBX files via
+    headless Blender: ``<stem>.fbx`` (opaque base) and ``<stem>_A.fbx`` (the
+    alpha-blend decals, separated, pushed off the surface, normals transferred from
+    the base). Used by ``zone export --alpha-split-mesh`` to solve the coplanar
+    decal z-fighting that FFXI ground overlays cause in Unreal. See
+    ``xi_glb_to_fbx._alpha_split_export`` for the per-mesh recipe.
+
+    ``decal_offset`` is how far (in mesh/FFXI units) each decal is lifted along the
+    base normal; ``smooth_angle`` is the auto-smooth angle in degrees; ``weld_dp``
+    the decimal places for the weld tolerance (matches ``--mesh-merge-dp``).
+    ``linear_colors`` and ``opaque_twins`` as for :func:`convert_glb_to_fbx`, applied
+    to both files.
+    """
+    blender = Path(BLENDER_PATH)
+    if not blender.is_file():
+        raise ValueError(
+            f"Blender not found at {blender}. Set BLENDER_PATH to your blender.exe to use --alpha-split-mesh."
+        )
+
+    fbx_path = glb_path.with_suffix(".fbx")
+    alpha_path = fbx_path.with_name(f"{fbx_path.stem}_A.fbx")
+    tex_dir = str(glb_path.parent.resolve())
+    completed = subprocess.run(
+        [str(blender), "-b", "--python", str(_GLB_TO_FBX_SCRIPT),
+         "--", str(glb_path), str(fbx_path), tex_dir, "0", "0.0",
+         "1", repr(float(smooth_angle)), repr(float(decal_offset)), str(int(weld_dp)),
+         "LINEAR" if linear_colors else "SRGB", "0", "1" if opaque_twins else "0"],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0 or not fbx_path.is_file() or not alpha_path.is_file():
+        detail = (completed.stderr or completed.stdout or "blender produced no output").strip()
+        raise ValueError(f"Blender alpha-split conversion failed:\n{detail}")
+    return [fbx_path, alpha_path]
 
 
 def list_mesh_parts(dat_path: Path) -> List[dict]:
@@ -898,7 +985,8 @@ def export_dat(dat_path: Path, output_dir: Path, fbx: bool = True,
                use_base: bool = True,
                weld: bool = True,
                split_tex: bool = False,
-               write_schema: bool = False) -> List[Path]:
+               write_schema: bool = False,
+               zero_coords: bool = False) -> List[Path]:
     from xi.xi_config import output_path_for
     base_path = output_path_for(dat_path).with_suffix(output_path_for(dat_path).suffix + ".base")
     if use_base and base_path.exists():
@@ -973,7 +1061,11 @@ def export_dat(dat_path: Path, output_dir: Path, fbx: bool = True,
     output_paths = build_gltf(dat_path, output_dir, joints, globals_by_joint, meshes, textures, alpha_scale=alpha_scale, mesh_merge_dp=mesh_merge_dp, weld=weld, split_tex=split_tex)
     if fbx:
         glb_path = output_paths[0]
-        output_paths.append(convert_glb_to_fbx(glb_path))
+        if zero_coords:
+            # A rigged model keeps its skeleton root at the origin, so nothing moves.
+            output_paths.append(convert_glb_to_fbx_zeroed(glb_path)[0])
+        else:
+            output_paths.append(convert_glb_to_fbx(glb_path))
 
     # Sidecar metadata JSON: identity (gear race/slot/model_id/file_id via
     # extra_metadata) + skeleton/mesh/texture summary + raw section opcodes.
@@ -1113,9 +1205,11 @@ import click as _click  # noqa: E402 — avoid polluting module top
                     '256x512, top = non-mirror side, bottom = mirror side) and remap the UVs so each '
                     'mirror half samples its own copy. One texture, no overlapping UVs, so you can '
                     'repaint each side independently.')
+@_click.option('--zero-coords', '--zero-cords', 'zero_coords', is_flag=True, default=False,
+               help='Every object in the FBX imports at location 0,0,0 with no rotation: the orientation fix is baked into the armature and mesh instead of a rotated root. The skeleton root stays the origin. Needs --fbx; the .glb is unchanged.')
 def cmd(dat_path: str, output, fbx: bool, lod: int, all_parts: bool, list_parts: bool,
         anim, frame: int, alpha_scale: float, mesh_merge_dp: int, no_base: bool, weld: bool,
-        split_tex: bool):
+        split_tex: bool, zero_coords: bool):
     """Export skeleton + mesh + textures from a DAT.
 
     DAT_PATH may be a filesystem path or a ROM-relative spec like ROM/128/79
@@ -1149,8 +1243,12 @@ def cmd(dat_path: str, output, fbx: bool, lod: int, all_parts: bool, list_parts:
         output_paths = export_dat(dat_path, output_dir, fbx=fbx, lod=lod, all_parts=all_parts,
                                   anim=anim, frame=frame, alpha_scale=alpha_scale,
                                   mesh_merge_dp=mesh_merge_dp, use_base=not no_base, weld=weld,
-                                  split_tex=split_tex, write_schema=SCHEMA_GENERATION)
+                                  split_tex=split_tex, write_schema=SCHEMA_GENERATION,
+                                  zero_coords=zero_coords)
     except ValueError as e:
         raise _click.ClickException(str(e))
     for output_path in output_paths:
         _click.echo(f'Exported: {output_path}')
+    if zero_coords:
+        _click.echo('(zero-coords: the FBX sits at 0,0,0 with no rotation)' if fbx
+                    else 'Note: --zero-coords zeroes the FBX and needs --fbx; the .glb is unchanged.')

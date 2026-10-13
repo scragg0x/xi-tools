@@ -2,6 +2,9 @@
 
 Paths can be ROM-relative, for example `ROM/1/41`, and resolve against `FFXI_DIR`.
 
+An import reads what its export wrote (`exports/<area>/…`); `--source-dir DIR` points `tex import`,
+`ui tex si`, `mesh import`, `gear import`, `anim import` and `zone import` at another folder.
+
 This lists the current public CLI command surface. Hidden compatibility aliases are not included.
 
 ## Top Level
@@ -46,12 +49,20 @@ WebSocket at `ws://HOST:PORT/ws`. Used by xi-zone-editor; exits after idle-secs 
 ```text
 xi dats json
 xi dats prepare
-xi dats build
-xi dats new
-xi dats package
+xi dats build                    # --pivot: into FFXI_PIVOT_DIR instead of FFXI_DIR
+                                 # applies on top; --reset: the tables it edits reset to the install's .base first
+                                 #   (--reset --pivot: the install's .base, else its file, into the pivot folder)
+xi dats build --list [--reset]   # the projects of projects/build_list.json (NAME --list: projects/NAME.json)
+                                 #   in order; --reset resets every table they edit once, first
+xi dats build LIST.json          # a build list file is built as one without --list
+                                 # abilities: --apply-db [--db-row ID] --clone-from X --server-id ID
+                                 #   --menu-record [--menu-name T] --lua-stub (docs/dats/README.md)
+xi dats new                      # --pivot: the same for the wizard
+xi dats package                  # an ability's client menu record ships with it (114.DAT + names)
 xi dats release
 xi dats changelog
-xi dats undo
+xi dats undo                     # --apply-db: also revert an ability's DB row and delete its Lua stub;
+                                 #   without it the manifest is kept (actions marked undone) while they remain
 ```
 
 ### Example: custom mesh end-to-end
@@ -60,10 +71,10 @@ xi dats undo
 # 1. Export source DAT to editable GLB (+ split textures + FBX)
 xi mesh export ROM/351/102 --split-tex --fbx
 
-# 2. Prepare a project manifest — writes dats/battle_worn_byakko.json
+# 2. Prepare a project manifest — writes projects/battle_worn_byakko.json
 xi dats prepare exports/mesh/rom/351/102/102_schema.json --project battle_worn_byakko --replace
 
-# 3. Build (auto-resolves dats/battle_worn_byakko.json) — writes DAT + patches FTABLE
+# 3. Build (auto-resolves projects/battle_worn_byakko.json) — writes DAT + patches FTABLE
 xi dats build battle_worn_byakko
 ```
 
@@ -99,9 +110,98 @@ xi ability inspect ws:N[:RACE]   # weapon-skill animation N (per race)
 xi ability inspect ROM/x/y       # any DAT; --routine TAG, --all, --json
 xi ability recipe SPEC           # starter recipe reproducing one source
 xi ability compose recipe.json   # recipe -> new DAT(s) (motion A + vfx B + sound C)
-xi ability publish recipe.json   # = dats prepare --type ability + dats build (--dry-run first)
-xi dats new                      # wizard: "Ability" content type; or: xi dats prepare recipe.json --project P
+                                 #   a weapon skill: one DAT per race in retail's folders, hf_1 { <dir> {…, main}
+                                 #   hf_1 {clips, traces} } (docs/ability/mixer.md#folders)
+                                 #   recipe "generators" / "curves": in-place edits to the carried particle
+                                 #   generators (tint, scale, spawn rate, texture id) and keyframe curves,
+                                 #   by lane + source name (docs/ability/mixer.md#generator-edits)
+                                 #   recipe "textures": a PNG (data: URI, or a .png beside the recipe) in place of a
+                                 #   lane's 0x20 texture (by id, plus its 16-char "name" where a DAT repeats an id),
+                                 #   DXT3 via texconv; --json lists replacements and renames
+                                 #   (docs/ability/mixer.md#textures)
+                                 #   an event with no "from" is a lock, hit or link added by hand: its own "raw"
+                                 #   bytes, in every race's DAT; a link the game won't find is a warning
+                                 #   (docs/ability/mixer.md#locks-hits-and-links)
+xi ability publish L.mix.json    # = dats prepare --type ability + dats build (--dry-run first; --animation-from N)
+                                 #   a mix file: *.mix.json (the old *.recipe.json is still read everywhere)
+                                 #   a custom-band weapon skill from non-weapon-skill motion registers retail's
+                                 #   160-byte [dumm] placeholder as each race's two waist companions
+                                 #   leaves projects/abilities/<slug>/: the SQL, a copy of every DAT
+                                 #   placed at its ROM path, placements.json (docs/ability/mixer.md#the-publish-folder)
+                                 #   --apply-db --clone-from fire: update / insert the server row (xi-tools .env XI_DB_*)
+                                 #   --menu-record: the client menu record at the same id (blank retail rows only)
+                                 #   --lua-stub: the server script for a row it created (XI_SERVER_DIR)
+                                 #   (docs/ability/mixer.md#database-update-client-menu-record-lua-stub)
+xi ability slots [--pivot]       # weapon-skill numbers 264–271 + the custom band 272–527: free, or what holds each
+xi dats new                      # wizard: "Ability" content type; or: xi dats prepare L.mix.json --project P
 xi mv update --only abilities    # the mixer's pick list (mv/lists/abilities.json)
+```
+
+## Spell / command menu records (new spell and job-ability ids)
+
+```text
+xi dats prepare X.spell.json --project P     # a definition (schema/spell_definition.json): clone retail spell N + names/fields
+xi dats prepare X.command.json --project P   # same for a job ability / weapon skill row (schema/command_definition.json)
+xi dats build P [--dry-run] [--pivot]        # grows ROM/118/114.DAT, writes the record + EN/JP names/help, records the id
+xi dats new [--pivot]                        # wizard: "Spell menu record" / "Command menu record"
+xi ui spells search NAME [--abilities]       # id, MP, cast/recast, learnable jobs (decoded records; --pivot)
+# ids past 1023 (spells) / 2815 (commands) need a client plugin such as cexislots — the build warns
+```
+
+## Database records (item, key item, title … edits — docs/database/README.md)
+
+```text
+xi dats prepare edits.json --project P [--merge]   # a list of edits (schema/database.json) -> action database.<name>
+xi dats build P [--dry-run] [--pivot]              # patches the records (EN + JP, legacy or retail DATs), writes P.sql (proposed, never run)
+                                                   #   an edit with "add": whole new items from fields into any item table
+xi dats new [--pivot]                              # wizard: "Database records" — table, id, then field=value lines
+xi dats undo P                                     # every record back to what it held; its SQL section removed
+xi database grow ROM/181/72.DAT 4096               # a table grown once (d_msg or item), its .base too
+                                                   #   --fill-from ROW | --fill-hex HEX, --pivot, --dry-run
+# spellData / abilityData: {"table": "spellData", "id": 1, "set": {"mp": 5, "levels": {"RDM": 1}}}
+# a new record: "copy_from": <id> (was "like"); exact bytes: "hex" (a whole record)
+# by path: {"table": "ROM/181/72.DAT", "id": 5, "strings": {"sub0": "…"}}
+#          {"table": "ROM/288/80.DAT", "layout": "armor", "id": 1030, "set": {"level": 75}}
+```
+
+## Zone dialog lines (docs/dialog/zone_dialog.md)
+
+```text
+xi dats prepare lines.json --project P [--merge]    # {"zone": 245, "lines": [...]} (schema/zone_dialog.json)
+xi dats prepare lines.json --project P --type zone_dialog --zone 245   # a bare list of lines
+xi dats build P [--dry-run] [--pivot]               # the zone's EN + JP dialog tables; "new" lines grow both
+xi dats new [--pivot]                               # wizard: "Zone dialog" — zone, line id, new text (old=>new)
+```
+
+## Zone NPCs (docs/zone/zone_npcs.md)
+
+```text
+xi dats prepare npcs.json --project P [--merge]     # {"zone": 245, "npcs": [...]} (schema/zone_npcs.json)
+xi dats build P [--dry-run] [--pivot]               # the zone's name table; npc_list rows -> P.sql (proposed, never run)
+xi dats new [--pivot]                               # wizard: "Zone NPCs" — rename by id, or new (name, model, status)
+```
+
+## Zone events (docs/events/zone_events.md)
+
+```text
+xi dats prepare cutscene.json --project P [--zone N] [--camera ROM10/490/55.DAT]   # one cutscene -> the zone's action
+xi dats prepare events.json --project P [--merge]   # {"zone": 243, "events": [...]} (schema/zone_events.json)
+xi dats build P [--dry-run] [--pivot]               # event + EN/JP dialog tables, camera scene DAT; P.lua + P.sql (never run)
+xi dats new [--pivot]                               # wizard: "Zone events" — zone, then a cutscene file or a dialogue
+xi event cutscene compile cs.json [--dry-run]       # the same, prepared + built (project: the zone's name)
+xi event dialogue new 245 --json lines.json --actor 0x010F5022   # a dialogue event, prepared + built
+xi dats undo P                                      # every block and line back; camera DATs removed
+```
+
+## Copy a file as it is (docs/dats/README.md)
+
+```text
+xi dats prepare rom/ROM/119/51.DAT --project P --type copy   # target guessed from the path: ROM/119/51.DAT
+xi dats prepare music067.bgw --project P --type copy --target sound9/win/music/data/music067.bgw
+xi dats prepare 206.DAT --project P --type copy --target ROM10/20/0.DAT --file-id 424764   # a new DAT: register its file id
+xi dats build P [--dry-run] [--pivot]               # written as it is; the install keeps <file>.base
+xi dats new [--pivot]                               # wizard: "Copy a file as it is"
+xi dats undo P                                      # install: .base back; pivot: the copy deleted
 ```
 
 ## Entity
@@ -172,7 +272,22 @@ xi zone fx list
 
 # zone export defaults to what the client draws; add the filtered classes back:
 xi zone export ROM/23/95 --with-collision-proxies --with-far-lod
+# drop the sub-area stand-ins (closed shop rooms, Ru'Aun's low-poly island platforms)
 xi zone export ROM/1/41 --no-subareas
+# + each sub-area from its own DAT as <stem>_<id>: 41 + 41_454 ... 41_466 (Ru'Aun: 107 + 107_524 ... 107_539)
+xi zone export ROM/1/41 --sub-areas --fbx
+# one file per mesh, and each sub-area's meshes in a 41_<id>/ folder
+xi zone export ROM/1/41 --objects --sub-areas --fbx
+# every FBX at 0,0,0 with no rotation; 41.zone.json says where each goes back (also mesh export / gear pose)
+xi zone export ROM/1/41 --unreal --objects --sub-areas --zero-coords
+# for Unreal/Unity/Godot: un-mirrored, CCW winding, mirrored tiles baked, terrain welded across UV seams
+xi zone export ROM/0/127 --fbx --right-handed --weld-seams
+# Unreal preset (= --right-handed --opaque --fbx + raw linear vertex colours + hidden duplicate tris dropped
+#   + foliage split into cutout/solid materials, wind weights in UV channel 1, one PNG per texture)
+# then import + run unreal-engine/ffxi_zone_setup.py - see unreal-engine/README.md
+xi zone export ROM/0/124 --unreal --no-sky --no-vfx
+# (Test) Alpha Split Mesh: two FBX (opaque base + separated ground decals) so decals stop z-fighting in Unreal
+xi zone export ROM/1/41 --alpha-split-mesh --right-handed
 
 xi object json
 xi object export
@@ -230,6 +345,7 @@ xi tex json
 xi tex list
 xi tex export
 xi tex import
+xi tex normals              # name normal maps for VanaCore texture packs (docs/tex/normals.md)
 
 xi ui tex
 xi ui tex export
@@ -254,6 +370,7 @@ xi ui tex si ROM/119/50.DAT --ffxi "<FFXI_PIVOT_DIR>"
 xi ui tex si ROM/119/50.DAT
 xi ui tex si ROM/119/50.DAT --no-resize        # import textures, leave rects alone
 xi ui tex si ROM/119/50.DAT --repair-rects     # rebuild rects from the reference sheet
+xi ui tex si rom/ROM/119/50.DAT --source-dir content/title   # PNGs from another folder (only read)
 
 # Go past vanilla resolution: keep a bigger PNG and scale its sprite rects to match
 xi ui tex si ROM/119/50.DAT --hd
@@ -350,13 +467,13 @@ xi ui items weapon import
 xi ui items weapon inject
 xi ui items weapon new
 
-xi ui items custom
-xi ui items custom search
-xi ui items custom export
-xi ui items custom json
-xi ui items custom import
-xi ui items custom inject
-xi ui items custom new
+xi ui items monstrosity
+xi ui items monstrosity search
+xi ui items monstrosity export
+xi ui items monstrosity json
+xi ui items monstrosity import
+xi ui items monstrosity inject
+xi ui items monstrosity new
 
 xi ui items mount
 xi ui items mount search
@@ -373,6 +490,7 @@ xi ui items mount import
 xi ftable expand
 xi ftable expand entity
 xi ftable expand gear
+xi ftable expand --no-dll          # tables + gear windows, FFXiMain.dll left alone (cexidats patches it)
 xi ftable reset
 xi ftable json
 xi ftable list
@@ -479,11 +597,11 @@ xi event npc add 243 "Name" --gap 10          # register a name for a new NPC id
 xi event cutscene
 xi event cutscene export
 xi event cutscene import
-xi event cutscene compile my_event.json       # JSON -> event/dialog DATs (finds the zone's DATs itself)
+xi event cutscene compile my_event.json       # JSON -> a zone_events action, built (docs/events/zone_events.md)
 
 xi event dialogue
 xi event dialogue actors
-xi event dialogue new
+xi event dialogue new                          # a dialogue event through a zone_events action
 xi event dialogue export
 xi event dialogue search
 xi event dialogue info
@@ -534,4 +652,8 @@ xi misc navmesh-prep
 xi server db
 xi server status
 xi server npc-snapshot      # bake the offline npc_list fallback the editor uses without a DB
+xi server check             # the local server setup, read-only: folder, DB (--no-db), tables, weapon-skill
+                            #   widening (--no-binary skips the PDB probe); --json (docs/server/README.md)
+xi server ws-widen          # write the C++ patch + SQL + README for weapon-skill animations above 255
+                            #   into projects/patches/ws_animation_16bit/ (--out, --print, --json); edits nothing
 ```

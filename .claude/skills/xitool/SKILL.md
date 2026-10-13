@@ -5,9 +5,11 @@ description: How to use the `xi` CLI in this repo (uv run xi …) for FFXI DAT m
 
 # xi-tools CLI skill
 
-(Changing the library rather than using it? `AGENTS.md` at the repo root has the rules:
-new content is an `xi dats` action type, every JSON format has a schema, viewer lists
-come from `xi mv update`.)
+(Changing the library rather than using it? Read `DESIGN.md` at the repo root first,
+the maintainer's design doc, and keep its §15 block in memory: the core (file loading,
+path resolution, pivot) doesn't change, new content is an `xi dats` action type, the
+command tree stays flat, every JSON format has a schema, everything is documented in
+`docs/`. `AGENTS.md` is the one-screen version.)
 
 `xi` is a Click CLI (`src/xi/xi_cli.py`) that reads and writes FFXI DAT files **in place**
 under `FFXI_DIR`. This skill tells you (1) the quirks of FFXI data that trip up every
@@ -111,7 +113,10 @@ Rules that follow:
 - The client never opens a path directly. `file_id` → `FTABLE.DAT` (u16: `subdir<<7 | index`)
   + `VTABLE.DAT` (u8: ROM number) → `ROM<n>/<subdir>/<index>.DAT`. Overlays (pivot, HD)
   shadow files at the same ROM path; a pack that ships its own tables **hides** base-table
-  registrations (a top crash cause).
+  registrations (a top crash cause). A `ROM{n}` pair (`ROM10/FTABLE10.DAT`) wins over the
+  main pair, and XIPivot shadows only `ROM{n}` pairs — the main `FTABLE.DAT`/`VTABLE.DAT`
+  always come from the install (`xi.ftable.xi_core.resolve_dat_in_root`,
+  `docs/dats/README.md` "Which table registers a file_id").
 - **Entity modelid → file_id** is a 4-range formula; custom content always uses
   `file_id = modelid + 98239` (the 3500+ range). Retail tops out at modelid ~11,241.
 - **Gear** is per `(race, slot)` group tables from `FFXiMain.dll` (`RACE_TABLES` in
@@ -140,10 +145,19 @@ Rules that follow:
     `anim import` unless `--no-base`.
   - Layer on the current file (re-running stacks): `zone import --add-collision` alone,
     `event dialogue edit`, `fx set/copy/delete`, `object import/clone`.
+  - `xi dats build`'s table edits (`database`, `zone_dialog`, `zone_npcs`, `zone_events`)
+    apply on top, replacing what they name (an edit already there is a no-op); `--reset`
+    resets the tables the build edits to the install's untouched copy first (its `.base`;
+    with `--pivot` copied over the pivot folder's, which keeps no `.base`); `--list` builds the
+    projects of `projects/build_list.json` in order, and a list file needs no `--list`
+    (`--list --reset`: every table they edit reset once, first). `xi database grow` grows the
+    install's table and its `.base` once (set-up; the actions only edit rows).
 - Prefer `--dry-run` where offered (`ftable expand`, `dats build`, `zone import-json`,
   `zone reset`, `mount import`, dialogue edits) before writing.
 - `xi dats build` writes into `FFXI_DIR` and then syncs the custom region of the pivot
   tables (`FFXI_PIVOT_DIR`) so sizes match — a table size mismatch crashes the client.
+  `--pivot` (also on `dats new`, `ability publish`, `ui spells`) writes `FFXI_PIVOT_DIR`
+  instead and skips the sync; without it that sync is the only pivot write a build makes.
 
 ### 2.7 Engine limits that decide "loads in a viewer but crashes in game"
 
@@ -188,11 +202,11 @@ Resolution order for any question about a command:
 | `xi title` | `src/xi/title/` | `docs/title/README.md`, `docs/dats/ROM_0_23.md`, `docs/HANDOVER.md` |
 | `xi event` | `src/xi/event/`, `src/xi/dialog/` | `docs/events/README.md` → `authoring/dialogue/format/opcodes/cutscenes.md`, `docs/dialog/*.md`, `docs/cutscene_authoring.md` |
 | `xi ftable` | `src/xi/ftable/` | `docs/ftable/*.md`, `docs/reference/model-file-ids.md` |
-| `xi dats` | `src/xi/dats/` | `docs/dats/README.md`, `schema/*.json` |
-| `xi ability` | `src/xi/ability/` | `docs/ability/{inspect,mixer}.md`, `schema/ability_recipe.json` (recipe), `schema/ability.json` (the `dats` action publish uses) |
+| `xi dats` | `src/xi/dats/` | `docs/dats/README.md`, `schema/*.json`; spell / command menu records: `src/xi/menu/`, `docs/menu/records.md`, `schema/{spell,command}_definition.json` |
+| `xi ability` | `src/xi/ability/` | `docs/ability/{inspect,mixer}.md`, `schema/ability_recipe.json` (recipe; a mix file, `*.mix.json`, formerly `*.recipe.json`), `schema/ability.json` (the `dats` action publish uses, with `result.db` / `menu` / `lua`), `schema/ability_publish.json` (the publish folder's `placements.json`); the build's server pass (`--apply-db`, `--menu-record`, `--lua-stub`): `src/xi/server/xi_server_pass.py`, `xi_db_apply.py`, `xi_lua_stub.py` |
 | `xi dll` | `src/xi/dll/`, `src/xi/ffximain/` | `docs/dll/README.md`, `docs/ffximain/*.md` |
 | `xi mv` | `src/xi/mv/` (+ `gear_sets.json`, `npc_anims.json`) | `docs/mv/README.md`, `docs/anim/fishing.md` |
-| `xi batch`, `xi misc`, `xi server`, `xi bridge` | `src/xi/{batch,misc,server,zone/xi_bridge.py}/` | `QUICKY.md`, `docs/zone/navmesh.md` |
+| `xi batch`, `xi misc`, `xi server`, `xi bridge` | `src/xi/{batch,misc,server,zone/xi_bridge.py}/` | `QUICKY.md`, `docs/zone/navmesh.md`; `xi server check` / `ws-widen`: `docs/server/README.md`, `schema/server_check.json`, `schema/server_ws_widen.json` |
 
 Cross-cutting references:
 - `docs/README.md` — index of every format doc with one-line summaries.
@@ -239,6 +253,7 @@ xi audio refs ROM/1/41                # which sounds a DAT references
 xi mesh export ROM/351/102 --split-tex --fbx      # → exports/mesh/rom/351/102/102.glb (+fbx, pngs)
 xi mesh export ROM/5/3 --anim idl --frame 0       # posed export
 xi mesh import ROM/351/102                        # auto-finds the export; rebuilds from .base
+xi mesh import ROM/351/102 --source-dir art/102   # the model from another folder (any import)
 xi mesh import ROM/351/102 model.glb --rotate-y -90 --scale 1.0
 ```
 
@@ -300,7 +315,7 @@ xi utils dds2png in.dds out.png / xi utils png2dds in.png out.dds
 xi event dialogue actors 245                      # NPC ids in a zone
 xi event dialogue search ROM/25/39.DAT "words"    # find an entry index
 xi event dialogue edit ROM/25/39.DAT --index 4 --text "Hello {player}!\nLine two.\v"
-xi event dialogue new 245 --json lines.json --actor 0x010F5022   # prints the event id + server Lua
+xi event dialogue new 245 --json lines.json --actor 0x010F5022   # a zone_events action, built; Lua in projects/<zone>.lua
 xi event cutscene export|import|compile …
 ```
 
@@ -309,7 +324,7 @@ xi event cutscene export|import|compile …
 ```bash
 uv run xi event explain 243 0x010F30EA --event 10124          # annotated disassembly (stops at a sub's first return)
 uv run xi event decompile 252 0x010FC08F --event 9506 -o oseem_9506.json --check   # retail -> xi.cutscene.v1 JSON, then recompile and compare
-uv run xi event cutscene compile my_event.json                # JSON -> event/dialog DATs
+uv run xi event cutscene compile my_event.json                # JSON -> the zone's zone_events action, built (xi dats undo)
 ```
 
 The JSON (`docs/events/authoring.md`, sections from 2026-09-03 onward) is the DAT-independent
@@ -335,6 +350,7 @@ xi ftable expand                                  # once per install
 xi dats new                                       # wizard: place prebuilt DATs at new ids
 xi dats prepare exports/mesh/rom/351/102/102_schema.json --project my_mob --replace
 xi dats build my_mob [--dry-run]                  # writes DATs + patches tables, syncs pivot
+xi dats build --list --reset                      # every project of projects/build_list.json, clean
 xi dats changelog --project my_mob / xi dats package / xi dats release / xi dats undo
 ```
 

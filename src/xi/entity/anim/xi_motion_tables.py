@@ -42,6 +42,7 @@ This partitions cleanly: no file_id is attributed to two different races
 exception, by game design).
 """
 
+import re
 import struct
 from dataclasses import dataclass
 from functools import lru_cache
@@ -306,6 +307,74 @@ def enumerate_race_animations(
                 # dense: skip non-animation slot, keep filling the window
 
 
+# -- a motion DAT in every race -------------------------------------------------
+
+@dataclass(frozen=True)
+class MotionSlot:
+    """Where a PC motion DAT sits in the client's per-race motion tables. The same
+    category and index name every race's own copy: ``base[race] + index``, which is
+    how the client itself finds a race's emote, battle pack or weapon skill."""
+    race: str            # the race whose file it is (TaruMale for the shared Taru row)
+    category: str
+    index: int
+    waist: bool = False  # an emote part-2 sibling: file-NUMBER +6 of the slot's DAT
+
+
+_SLOT_TABLES = None
+
+
+def _rom_key(spec: str) -> str:
+    return re.sub(r'\.DAT$', '', str(spec).replace('\\', '/').strip('/'), flags=re.I).upper()
+
+
+def _slot_tables():
+    """``(category bases, ROM key -> MotionSlot, resolver)``, built once per process
+    from FFXiMain.dll and the file tables alone. No motion DAT is read: about 20,000
+    ids resolve in a few hundredths of a second."""
+    global _SLOT_TABLES
+    if _SLOT_TABLES is None:
+        cat_bases = category_bases(load_maindll())
+        windows = _window_sizes(cat_bases)
+        resolver = _FileIdResolver()
+        by_key: Dict[str, MotionSlot] = {}
+        for cat, bases in cat_bases.items():
+            for ri, race in enumerate(RACE_NAMES):
+                for off in range(windows[cat]):
+                    spec = resolver.rom_spec(bases[ri] + off)
+                    if not spec:
+                        continue
+                    by_key.setdefault(_rom_key(spec), MotionSlot(race, cat, off))
+                    if cat == 'emote':
+                        waist = _waist_sibling_spec(spec)
+                        if waist:
+                            by_key.setdefault(_rom_key(waist), MotionSlot(race, cat, off, True))
+        _SLOT_TABLES = (cat_bases, by_key, resolver)
+    return _SLOT_TABLES
+
+
+def motion_slot_for(spec: str) -> Optional[MotionSlot]:
+    """The per-race motion slot a ROM DAT spec occupies, or None when the client's
+    motion tables do not index it (an effect DAT, a monster, or a pack such as a
+    race's Variations files, which belong to that one race)."""
+    try:
+        return _slot_tables()[1].get(_rom_key(spec))
+    except (OSError, ValueError):
+        return None
+
+
+def motion_dat_for_race(slot: MotionSlot, race) -> Optional[str]:
+    """ROM spec of ``slot`` in ``race``'s motion set (the waist sibling for a waist
+    slot), or None when that race's table entry resolves to nothing."""
+    cat_bases, _, resolver = _slot_tables()
+    bases = cat_bases.get(slot.category)
+    if not bases:
+        return None
+    spec = resolver.rom_spec(bases[race_index(race)] + slot.index)
+    if spec and slot.waist:
+        spec = _waist_sibling_spec(spec)
+    return spec
+
+
 # -- weapon-skill banks --------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -450,6 +519,25 @@ def weapon_skill_slot(banks: Dict[str, WsBank], race, animation: int) -> WsSlot:
     animation = int(animation)
     if not 0 <= animation <= 0xFFF:
         raise ValueError(f'animation {animation} is not a 12-bit action animation number')
+    # A configured custom band sits above both retail banks. Its ids are grouped by
+    # animation number — eight races of body clip, then eight of waist pack A, then
+    # eight of B — so the reserved slot count stays out of the arithmetic and raising
+    # it later moves nothing already published. It resolves only on a client whose
+    # animation-to-file-id arithmetic has been patched to reach it (xi_config).
+    import xi.xi_config as cfg
+    if cfg.FX_WS_BAND_FIRST and cfg.FX_WS_BAND_BASE and animation >= cfg.FX_WS_BAND_FIRST:
+        last = cfg.FX_WS_BAND_FIRST + (cfg.FX_WS_BAND_SLOTS or 0) - 1
+        if cfg.FX_WS_BAND_SLOTS and animation > last:
+            raise ValueError(f'animation {animation} is past the custom weapon-skill band '
+                             f'({cfg.FX_WS_BAND_FIRST}..{last}); raise FX_WS_BAND_SLOTS')
+        idx = animation - cfg.FX_WS_BAND_FIRST
+        # The race term is 1-based: at runtime the client (and cexislots' bank stub, which
+        # inherits the client's register) indexes the band by the RaceGenderConfig number
+        # 1..8 (Hume male is 1), not by ri (0..7). Retail hides this -- its bank pointer is
+        # pre-offset so table[1] is the first race -- but the flat custom arithmetic adds the
+        # index straight, so we place at ri + 1 or Hume male lands on Hume female's file id.
+        body = cfg.FX_WS_BAND_BASE + idx * 24 + (ri + 1)
+        return WsSlot(RACE_NAMES[ri], animation, 'custom', idx, body, body + 8, body + 16)
     bank = banks.get('primary' if animation < WS_EXTENDED_FIRST else 'extended')
     if bank is None or not bank.contains(animation):
         have = ', '.join(f'{b.name} {b.first_animation}..{b.last_animation}'

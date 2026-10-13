@@ -1,0 +1,618 @@
+"""The ``database`` action of ``xi dats``: edits to the client's record tables (schema/database.json).
+
+A table is one the model viewer's Database shows, by the same key (``xi.mv.xi_database``,
+kept in step with the viewer's ``ui/js/database.js``); a field is the viewer's name for it.
+This module holds the names the action is written in — tables, fields, sub-strings, jobs,
+races, slots, flags, weapon skills — the hand validator for the schema, and the encoders
+that turn names into each side's bits: the DAT keeps WAR at job bit 1, the server at bit 0.
+
+Checked against CatsEyeXI's item JSON and the DATs built from it (5,090 weapons): every
+job, race, slot, flag and skill name lands on the bit / number below.
+"""
+from __future__ import annotations
+
+import re
+
+from xi.mv.xi_database import DMSG_TABLES, ITEM_TABLES, MENU_TABLES, _FIELD_KEYS
+from xi.ui.items.xi_layout import FIELDS, FORMAT_LEGACY, LAYOUTS
+
+JOBS = ["WAR", "MNK", "WHM", "BLM", "RDM", "THF", "PLD", "DRK", "BST", "BRD", "RNG", "SAM",
+        "NIN", "DRG", "SMN", "BLU", "COR", "PUP", "DNC", "SCH", "GEO", "RUN"]
+RACES = ["HUME_M", "HUME_F", "ELVAAN_M", "ELVAAN_F", "TARU_M", "TARU_F", "MITHRA", "GALKA"]
+SLOTS = ["MAIN", "SUB", "RANGED", "AMMO", "HEAD", "BODY", "HANDS", "LEGS", "FEET",
+         "NECK", "WAIST", "EAR1", "EAR2", "RING1", "RING2", "BACK"]
+# The server's ITEM_FLAG enum (src/map/items/item.h), bit n = FLAGS[n]; the DAT uses the same bits.
+FLAGS = ["WALLHANGING", "UNKNOWN_01", "MYSTERY_BOX", "MOG_GARDEN", "MAIL2ACCOUNT", "INSCRIBABLE",
+         "NOAUCTION", "SCROLL", "LINKSHELL", "CANUSE", "CANTRADENPC", "CANEQUIP", "NOSALE",
+         "NODELIVERY", "EX", "RARE"]
+SKILLS = {"NONE": 0, "HAND_TO_HAND": 1, "DAGGER": 2, "SWORD": 3, "GREAT_SWORD": 4, "AXE": 5,
+          "GREAT_AXE": 6, "SCYTHE": 7, "POLEARM": 8, "KATANA": 9, "GREAT_KATANA": 10, "CLUB": 11,
+          "STAFF": 12, "ARCHERY": 25, "MARKSMANSHIP": 26, "THROWING": 27, "STRING_INSTRUMENT": 41,
+          "WIND_INSTRUMENT": 42, "HANDBELL": 45, "FISHING": 48}
+
+# ── tables ───────────────────────────────────────────────────────────────────
+
+# Item tables whose records have a known header (the rest are special blocks with no fields).
+ITEM_LAYOUT = {key: layout for key, layout, _parts in ITEM_TABLES if layout in LAYOUTS}
+
+_QUEST_SUBS = ["id", "name", "description"]
+_HELP_SUBS = ["help"]            # the help tables hold one sub-string, the text (both clients)
+# d_msg sub-string names per table — the viewer's DMSG_GROUPS. `id`/`unk*` are not editable:
+# `id` is how a key-item / quest / mission row is addressed.
+DMSG_SUBS = {key: (_QUEST_SUBS if key[:2] in ("q_", "m_") else None) for key, _en, _jp in DMSG_TABLES}
+DMSG_SUBS.update({
+    "keyitems": ["id", "category", "unk2", "unk3", "name", "plural", "description"],
+    "titles": ["name"], "jobs": ["name"], "spells": ["name"], "spellHelp": _HELP_SUBS,
+    "abilities": ["name"], "abilityHelp": _HELP_SUBS, "bluHelp": _HELP_SUBS,
+    "status": ["name", "adjective"], "mounts": ["name", "keyItem"], "mountHelp": _HELP_SUBS,
+    "monsterFamilies": ["name", "plural"], "slots": ["name"], "augments": ["format"],
+    "merits": ["text"], "jobPoints": ["text"], "jobGifts": ["text"], "soulplates": ["text"],
+    "trust": ["text"], "emoteHelp": ["text"], "chatHelp": ["text"], "mazeRunes": _HELP_SUBS,
+    "headings": ["name"], "servers": ["name"],
+})
+# The Japanese tables that differ: key items keep only id, name and description; status
+# names have no adjective.
+DMSG_SUBS_JP = {"keyitems": ["id", "name", "description"], "status": ["name"]}
+# d_msg tables whose rows carry their own id: an edit's `id` is that id, not the row index.
+ID_KEYED = {key for key, subs in DMSG_SUBS.items() if subs and subs[0] == "id"}
+
+# The spell and command records of ROM/118/114.DAT (xi.menu.xi_menu_table): one file for
+# every client language. table -> the menu kind.
+MENU_KINDS = {key: kind for key, kind, _names, _help in MENU_TABLES}
+# A d_msg table named by its ROM path: its sub-strings are sub0, sub1, …; a row is its index.
+_RAW_RE = re.compile(r"^ROM\d*/\d+/\d+\.DAT$", re.I)
+_SUB_RE = re.compile(r"^sub(\d+)$")
+
+
+def is_raw(table) -> bool:
+    return isinstance(table, str) and bool(_RAW_RE.match(table))
+
+
+def subs(table: str, lang: str) -> list[str]:
+    """Sub-string names of a d_msg table in one language."""
+    if lang == "jp" and table in DMSG_SUBS_JP:
+        return DMSG_SUBS_JP[table]
+    return DMSG_SUBS[table]
+
+ITEM_STRINGS = {"en": ["name", "article", "logName", "logPlural", "description"], "jp": ["name", "description"]}
+_NUMERIC_SUBS = {"article": 3, "category": None, "keyItem": None}   # name -> maximum (None: any u32)
+
+
+def tables() -> list[str]:
+    """Every table key an edit may name: item tables with a known layout, d_msg tables, the
+    spell and command records (a d_msg table may also be named by its ROM path)."""
+    return list(ITEM_LAYOUT) + list(DMSG_SUBS) + list(MENU_KINDS)
+
+
+def menu_fields(table: str) -> list[str]:
+    """The fields ``set`` may name for a spell / command record table."""
+    from xi.menu.xi_menu_table import KINDS, unknown_fields
+    kind = MENU_KINDS[table]
+    return ([n for n in KINDS[kind].fields if n != "id"] + (["levels"] if kind == "spell" else [])
+            + list(unknown_fields(kind)))
+
+
+def set_fields(table: str) -> list[str]:
+    """The header fields ``set`` may name for an item table (the viewer's names)."""
+    return layout_fields(ITEM_LAYOUT[table])
+
+
+def layout_fields(layout: str) -> list[str]:
+    """The header fields ``set`` may name for records of an item layout (the viewer's names)."""
+    from xi.ui.items.xi_layout import UNKNOWN_FIELDS
+    names = [*FIELDS[layout][FORMAT_LEGACY], *UNKNOWN_FIELDS.get(layout, {}).get(FORMAT_LEGACY, {})]
+    return [_FIELD_KEYS.get(n, n) for n in names if n != "id"]
+
+
+def string_names(table: str, lang: str) -> list[str]:
+    if table in ITEM_LAYOUT:
+        return ITEM_STRINGS[lang]
+    return [s for s in subs(table, lang) if s != "id" and not s.startswith("unk")]
+
+
+# ── encoders ─────────────────────────────────────────────────────────────────
+
+def _mask(names, table: list[str], shift: int = 0) -> int:
+    return sum(1 << (table.index(n) + shift) for n in names)
+
+
+def job_mask(jobs, side: str = "dat") -> int:
+    """Jobs as bits: ``side`` 'dat' (WAR = bit 1, all = 0x7FFFFE) or 'server' (WAR = bit 0)."""
+    names = JOBS if jobs == "all" else jobs
+    return _mask(names, JOBS, 1 if side == "dat" else 0)
+
+
+def race_mask(races) -> int:
+    return _mask(RACES if races == "all" else races, RACES, 1)
+
+
+def slot_mask(slots) -> int:
+    return _mask(slots, SLOTS)
+
+
+def flag_mask(flags) -> int:
+    return _mask(flags, FLAGS)
+
+
+def skill_id(skill) -> int:
+    return skill if isinstance(skill, int) else SKILLS[skill]
+
+
+# ── validation ───────────────────────────────────────────────────────────────
+
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+_MOD_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_ACTION_KEYS = {"id", "type", "enabled", "description", "depends_on", "edits", "server", "result", "outputs"}
+_EDIT_KEYS = {"table", "id", "copy_from", "note", "set", "strings", "icon", "server", "hex", "layout"}
+_ADD_KEYS = {"table", "layout", "table_jp", "add", "note"}
+_ENTRY_KEYS = {"id", "layout", "set", "strings", "icon", "note"}
+_SERVER_KEYS = {"emit", "mirror", "sql"}
+
+# Server columns (catseyexi sql/item_*.sql; item_info is CatsEyeXI's, modules sql/custom).
+_ROW_COLS = {
+    "item_basic": {"subid", "name", "sortname", "type", "stackSize", "flags", "aH", "BaseSell"},
+    "item_equipment": {"name", "level", "ilevel", "jobs", "MId", "shieldSize", "scriptType", "slot", "rslot",
+                       "rslotlook", "su_level"},
+    "item_weapon": {"name", "skill", "subskill", "ilvl_skill", "ilvl_parry", "ilvl_macc", "dmgType", "hit",
+                    "delay", "dmg", "unlock_points"},
+    "item_usable": {"name", "validTargets", "activation", "animation", "animationTime", "maxCharges",
+                    "useDelay", "reuseDelay", "aoe"},
+    "item_furnishing": {"name", "storage", "moghancement", "element", "aura"},
+    "item_info": {"icon", "desc"},
+}
+_LIST_ROWS = {"item_mods_pet": ({"mod", "value", "petType"}, {"mod", "value"}),
+              "item_latents": ({"mod", "value", "latentId", "latentParam"}, {"mod", "value", "latentId"})}
+SERVER_TABLES = [*_ROW_COLS, "item_mods", *_LIST_ROWS]
+
+
+def _is_int(v, lo: int = 0, hi: int | None = None) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= lo and (hi is None or v <= hi)
+
+
+def _unknown(obj: dict, allowed, at: str, errs: list) -> None:
+    for k in obj:
+        if k not in allowed:
+            errs.append(f"{at}: unknown key {k!r}")
+
+
+def _names(value, allowed: list[str], what: str, at: str, errs: list, allow_all: bool = False) -> None:
+    if allow_all and value == "all":
+        return
+    if not isinstance(value, list):
+        errs.append(f"{at} must be a list of {what} names" + (' or "all"' if allow_all else ""))
+        return
+    for v in value:
+        if v not in allowed:
+            errs.append(f"{at}: {v!r} is not a {what} ({', '.join(allowed)})")
+    if len(set(map(str, value))) != len(value):
+        errs.append(f"{at}: a {what} is listed twice")
+
+
+def _check_set(table: str, values, at: str, errs: list, layout: str | None = None) -> None:
+    if not isinstance(values, dict):
+        errs.append(f"{at} must be an object")
+        return
+    layout = layout or ITEM_LAYOUT[table]
+    fields = layout_fields(layout)
+    for name, v in values.items():
+        where = f"{at}.{name}"
+        if name not in fields:
+            errs.append(f"{where}: table {table!r} ({layout} layout) has no field {name!r}"
+                        f" — it has {', '.join(fields)}")
+        elif name == "flags":
+            _names(v, FLAGS, "flag", where, errs)
+        elif name == "jobs":
+            _names(v, JOBS, "job", where, errs, allow_all=True)
+        elif name == "races":
+            _names(v, RACES, "race", where, errs, allow_all=True)
+        elif name == "slots":
+            _names(v, SLOTS, "slot", where, errs)
+        elif name == "skill":
+            if not (v in SKILLS or _is_int(v, 0, 255)):
+                errs.append(f"{where}: {v!r} is not a skill name or number 0-255")
+        elif name == "jugSize":
+            if not _is_int(v, 0, 255):
+                errs.append(f"{where} must be an integer 0-255")
+        elif name == "elementCharge":
+            if not _is_int(v, 0, 0xFFFFFFFF):
+                errs.append(f"{where} must be an integer 0-4294967295")
+        elif not _is_int(v, 0, 0xFFFF):
+            errs.append(f"{where} must be an integer 0-65535")
+
+
+def _check_strings(table: str, strings, at: str, errs: list) -> None:
+    if not isinstance(strings, dict):
+        errs.append(f"{at} must be an object")
+        return
+    for lang, subs in strings.items():
+        where = f"{at}.{lang}"
+        if lang not in ("en", "jp"):
+            errs.append(f"{at}: unknown language {lang!r} (en, jp)")
+            continue
+        if not isinstance(subs, dict):
+            errs.append(f"{where} must be an object")
+            continue
+        names = string_names(table, lang)
+        for name, v in subs.items():
+            if name not in names:
+                errs.append(f"{where}: table {table!r} has no {lang} string {name!r} — it has {', '.join(names)}")
+            elif name in _NUMERIC_SUBS:
+                if not _is_int(v, 0, _NUMERIC_SUBS[name]):
+                    hi = _NUMERIC_SUBS[name]
+                    errs.append(f"{where}.{name} must be an integer" + (f" 0-{hi}" if hi is not None else ""))
+            elif isinstance(v, dict):
+                rep = v.get("replace")
+                if set(v) != {"replace"} or not isinstance(rep, dict) or not rep \
+                        or not all(isinstance(a, str) and a and isinstance(b, str) for a, b in rep.items()):
+                    errs.append(f"{where}.{name} must be text or {{\"replace\": {{old: new, …}}}}")
+            elif not isinstance(v, str):
+                errs.append(f"{where}.{name} must be a string")
+
+
+def _check_menu_set(table: str, values, at: str, errs: list) -> None:
+    from xi.menu.xi_menu_table import ELEMENTS as M_ELEMENTS, JOBS as M_JOBS, KINDS, SPELL_KINDS, unknown_fields
+    if not isinstance(values, dict):
+        errs.append(f"{at} must be an object")
+        return
+    kind = MENU_KINDS[table]
+    fields = menu_fields(table)
+    for name, v in values.items():
+        where = f"{at}.{name}"
+        if name not in fields:
+            errs.append(f"{where}: table {table!r} has no field {name!r} — it has {', '.join(fields)}")
+        elif name == "levels":
+            if not isinstance(v, dict):
+                errs.append(f"{where} must map jobs to levels ({{\"WHM\": 1, \"RDM\": null}})")
+                continue
+            for job, lvl in v.items():
+                if str(job).upper() not in M_JOBS[1:]:
+                    errs.append(f"{where}: {job!r} is not a job ({', '.join(M_JOBS[1:])})")
+                elif lvl is not None and not _is_int(lvl, 0, 0xFFFE):
+                    errs.append(f"{where}.{job} must be a level 0-65534, or null: can't learn it")
+        elif name == "element" and isinstance(v, str):
+            if v.lower() not in M_ELEMENTS.values():
+                errs.append(f"{where}: {v!r} is not an element ({', '.join(M_ELEMENTS.values())})")
+        elif name == "kind" and kind == "spell" and isinstance(v, str):
+            if v.lower() not in SPELL_KINDS.values():
+                errs.append(f"{where}: {v!r} is not a spell kind ({', '.join(SPELL_KINDS.values())})")
+        else:
+            size = (KINDS[kind].fields.get(name) or unknown_fields(kind)[name])[1]
+            if not _is_int(v, 0, 0xFF if size == 1 else 0xFFFF):
+                errs.append(f"{where} must be an integer 0-{0xFF if size == 1 else 0xFFFF}")
+
+
+def _check_hex(v, size: int | None, at: str, errs: list) -> None:
+    if not isinstance(v, str):
+        errs.append(f"{at} must be hex text")
+        return
+    try:
+        raw = bytes.fromhex(v.replace(" ", ""))
+    except ValueError:
+        errs.append(f"{at} is not hex")
+        return
+    if size is not None and len(raw) != size:
+        errs.append(f"{at} is {len(raw)} bytes; a record of this table is {size}")
+
+
+def _check_icon(icon, at: str, errs: list) -> None:
+    if not isinstance(icon, dict):
+        errs.append(f"{at} must be an object")
+        return
+    _unknown(icon, {"from", "file", "tag"}, at, errs)
+    if "file" in icon:
+        if "from" in icon:
+            errs.append(f"{at}: give from or file, not both")
+        if not (isinstance(icon["file"], str) and icon["file"].lower().endswith(".bmp")):
+            errs.append(f"{at}.file must be a .bmp file, relative to the file holding the action")
+        tag = icon.get("tag", "")
+        if not (isinstance(tag, str) and tag.isascii() and len(tag) <= 16):
+            errs.append(f"{at}.tag must be ASCII text of 16 characters or fewer")
+    elif "tag" in icon:
+        errs.append(f"{at}.tag goes with file")
+    elif not _is_int(icon.get("from")):
+        errs.append(f"{at}.from must be the item id whose icon to copy")
+
+
+def _check_server(rows, at: str, errs: list) -> None:
+    if rows is False:
+        return
+    if not isinstance(rows, dict):
+        errs.append(f"{at} must be an object of server tables, or false")
+        return
+    for table, row in rows.items():
+        where = f"{at}.{table}"
+        if table not in SERVER_TABLES:
+            errs.append(f"{at}: unknown server table {table!r} ({', '.join(SERVER_TABLES)})")
+        elif table == "item_mods":
+            if not isinstance(row, dict):
+                errs.append(f"{where} must map mod names to values")
+                continue
+            for mod, v in row.items():
+                if not _MOD_RE.match(str(mod)):
+                    errs.append(f"{where}: {mod!r} is not a mod name (xi.mod, e.g. DEF, HP, ACC)")
+                if v is not None and not _is_int(v, -(1 << 31)):
+                    errs.append(f"{where}.{mod} must be an integer, or null to remove the mod")
+        elif table in _LIST_ROWS:
+            allowed, required = _LIST_ROWS[table]
+            if not isinstance(row, list):
+                errs.append(f"{where} must be a list")
+                continue
+            for i, r in enumerate(row):
+                rat = f"{where}[{i}]"
+                if not isinstance(r, dict):
+                    errs.append(f"{rat} must be an object")
+                    continue
+                _unknown(r, allowed, rat, errs)
+                for k in sorted(required - r.keys()):
+                    errs.append(f"{rat}: missing {k!r}")
+                if "mod" in r and not _MOD_RE.match(str(r["mod"])):
+                    errs.append(f"{rat}.mod: {r['mod']!r} is not a mod name")
+                for k in allowed - {"mod"}:
+                    if k in r and not _is_int(r[k], -(1 << 31)):
+                        errs.append(f"{rat}.{k} must be an integer")
+        else:
+            if not isinstance(row, dict):
+                errs.append(f"{where} must be an object of columns")
+                continue
+            for col, v in row.items():
+                cat = f"{where}.{col}"
+                if col not in _ROW_COLS[table]:
+                    errs.append(f"{where}: unknown column {col!r} ({', '.join(sorted(_ROW_COLS[table]))})")
+                elif col in ("name", "sortname"):
+                    if not isinstance(v, str):
+                        errs.append(f"{cat} must be a string")
+                elif col == "desc":
+                    if not (v is None or isinstance(v, str)):
+                        errs.append(f"{cat} must be a string or null")
+                elif col == "flags":
+                    _names(v, FLAGS, "flag", cat, errs)
+                elif col == "jobs":
+                    _names(v, JOBS, "job", cat, errs, allow_all=True)
+                elif col in ("slot", "rslot"):
+                    _names(v, SLOTS, "slot", cat, errs)
+                elif col == "skill":
+                    if not (v in SKILLS or _is_int(v, 0, 255)):
+                        errs.append(f"{cat}: {v!r} is not a skill name or number 0-255")
+                elif col == "MId":
+                    if isinstance(v, dict):
+                        _unknown(v, {"gear"}, cat, errs)
+                        if not (isinstance(v.get("gear"), str) and _ID_RE.match(v["gear"])):
+                            errs.append(f"{cat}.gear must be a gear action id")
+                    elif not _is_int(v, 0, 4095):
+                        errs.append(f"{cat} must be a model id 0-4095 or {{\"gear\": <action id>}}")
+                elif not _is_int(v, -(1 << 31)):
+                    errs.append(f"{cat} must be an integer")
+
+
+def _check_add_edit(edit: dict, at: str, errs: list) -> None:
+    """``add``: whole item records made from fields, into an item table (a named one, or a
+    ROM path with its layout; ``table_jp`` the Japanese file of a path table). An entry with an
+    ``id`` replaces that item; one without goes into the next empty row, skipped when the table
+    already has an item of its English name (case-insensitive)."""
+    _unknown(edit, _ADD_KEYS, at, errs)
+    table = edit.get("table")
+    path = is_raw(table)
+    if table not in ITEM_LAYOUT and not path:
+        errs.append(f"{at}.table must be an item table ({', '.join(ITEM_LAYOUT)}) or an item DAT's ROM path")
+        return
+    if path and edit.get("layout") not in LAYOUTS:
+        errs.append(f"{at}.layout must be an item layout ({', '.join(LAYOUTS)})")
+    if not path and ("layout" in edit or "table_jp" in edit):
+        errs.append(f"{at}: layout and table_jp go with an item table given by its ROM path")
+    if "table_jp" in edit and not is_raw(edit["table_jp"]):
+        errs.append(f"{at}.table_jp must be the Japanese file's ROM path")
+    entries = edit.get("add")
+    if not isinstance(entries, list) or not entries:
+        errs.append(f"{at}.add must be a non-empty list of items")
+        return
+    ids: dict = {}
+    for i, entry in enumerate(entries):
+        where = f"{at}.add[{i}]"
+        if not isinstance(entry, dict):
+            errs.append(f"{where} must be an object")
+            continue
+        _unknown(entry, _ENTRY_KEYS, where, errs)
+        layout = entry.get("layout") or (edit.get("layout") if path else ITEM_LAYOUT.get(table))
+        if "layout" in entry and entry["layout"] not in LAYOUTS:
+            errs.append(f"{where}.layout must be an item layout ({', '.join(LAYOUTS)})")
+            layout = None
+        if "id" in entry:
+            if not _is_int(entry["id"]):
+                errs.append(f"{where}.id must be an item id")
+            elif entry["id"] in ids:
+                errs.append(f"{where}: id {entry['id']} is already added by add[{ids[entry['id']]}]")
+            else:
+                ids[entry["id"]] = i
+        strings = entry.get("strings", {})
+        if not isinstance(strings, dict) or set(strings) - {"en", "jp"}:
+            errs.append(f"{where}.strings must be {{\"en\": {{…}}, \"jp\": {{…}}}}")
+        else:
+            for lang, spec in strings.items():
+                if not isinstance(spec, dict):
+                    errs.append(f"{where}.strings.{lang} must be an object")
+                    continue
+                for key, v in spec.items():
+                    if key not in ITEM_STRINGS[lang]:
+                        errs.append(f"{where}.strings.{lang}.{key}: an item's {lang} strings are "
+                                    f"{', '.join(ITEM_STRINGS[lang])}")
+                    elif key in _NUMERIC_SUBS and not _is_int(v):
+                        errs.append(f"{where}.strings.{lang}.{key} must be a number")
+                    elif key not in _NUMERIC_SUBS and not isinstance(v, str):
+                        errs.append(f"{where}.strings.{lang}.{key} must be text")
+        if "id" not in entry and not ((strings.get("en") or {}).get("name") if isinstance(strings, dict) else None):
+            errs.append(f"{where}: an item without an id needs strings.en.name (it must be unique in the table)")
+        if "set" in entry and layout:
+            _check_set(table, entry["set"], f"{where}.set", errs, layout)
+        if "icon" in entry:
+            _check_icon(entry["icon"], f"{where}.icon", errs)
+        if "note" in entry and not isinstance(entry["note"], str):
+            errs.append(f"{where}.note must be a string")
+
+
+def _check_edit(edit, at: str, errs: list) -> tuple | None:
+    if not isinstance(edit, dict):
+        errs.append(f"{at} must be an object")
+        return None
+    if "add" in edit:
+        _check_add_edit(edit, at, errs)
+        return None
+    if "like" in edit:
+        errs.append(f"{at}: like is now copy_from")
+    _unknown({k: v for k, v in edit.items() if k != "like"}, _EDIT_KEYS, at, errs)
+    table = edit.get("table")
+    if table not in ITEM_LAYOUT and table not in DMSG_SUBS and table not in MENU_KINDS and not is_raw(table):
+        errs.append(f"{at}.table: {table!r} is not a table ({', '.join(tables())}) or a d_msg table's "
+                    "ROM path (ROM/181/72.DAT)")
+        return None
+    if not _is_int(edit.get("id")):
+        errs.append(f"{at}.id must be a record id (an integer >= 0)")
+    if "hex" in edit and ({"set", "strings", "icon", "copy_from"} & edit.keys()):
+        errs.append(f"{at}: hex is the whole record; give it alone (no set, strings, icon or copy_from)")
+    if is_raw(table) and "layout" in edit:
+        return _check_item_path_edit(table, edit, at, errs)
+    if "layout" in edit:
+        errs.append(f"{at}.layout: only an item table given by its ROM path takes layout")
+    if table in MENU_KINDS or is_raw(table):
+        return _check_plain_edit(table, edit, at, errs)
+    item = table in ITEM_LAYOUT
+    for key in ("set", "icon", "server"):
+        if key in edit and not item:
+            errs.append(f"{at}.{key}: only item tables take {key!r} ({table!r} is a text table)")
+    if "copy_from" in edit and not _is_int(edit["copy_from"]):
+        errs.append(f"{at}.copy_from must be " + ("an item id" if item else "a row (or key item) id to copy"))
+    if "note" in edit and not isinstance(edit["note"], str):
+        errs.append(f"{at}.note must be a string")
+    if item and "set" in edit:
+        _check_set(table, edit["set"], f"{at}.set", errs)
+    if "strings" in edit:
+        _check_strings(table, edit["strings"], f"{at}.strings", errs)
+    if item and "icon" in edit:
+        _check_icon(edit["icon"], f"{at}.icon", errs)
+    if item and "server" in edit:
+        _check_server(edit["server"], f"{at}.server", errs)
+    if "hex" in edit:
+        if not isinstance(edit["hex"], dict) or not edit["hex"] or not set(edit["hex"]) <= {"en", "jp"}:
+            errs.append(f"{at}.hex must be {{\"en\": \"…\", \"jp\": \"…\"}}: each language's whole record")
+        else:
+            for lang, v in edit["hex"].items():
+                _check_hex(v, None, f"{at}.hex.{lang}", errs)
+    if not ({"copy_from", "set", "strings", "icon", "hex", "like"} & edit.keys() or edit.get("server")):
+        errs.append(f"{at}: the edit changes nothing (give set, strings, icon, copy_from, hex or server)")
+    return table, edit.get("id")
+
+
+def _check_sub_strings(strings, at: str, errs: list) -> None:
+    """``strings`` of a table given by path: its sub-strings by position, sub0, sub1, …"""
+    if not isinstance(strings, dict) or not strings:
+        errs.append(f"{at} must name the sub-strings to set (sub0, sub1, …)")
+        return
+    for name, v in strings.items():
+        where = f"{at}.{name}"
+        if not _SUB_RE.match(str(name)):
+            errs.append(f"{where}: a table by path names its sub-strings sub0, sub1, …")
+        elif isinstance(v, dict):
+            rep_ = v.get("replace")
+            if set(v) != {"replace"} or not isinstance(rep_, dict) or not rep_:
+                errs.append(f"{where} must be text, a number or {{\"replace\": {{old: new, …}}}}")
+        elif not (isinstance(v, str) or _is_int(v, 0, 0xFFFFFFFF)):
+            errs.append(f"{where} must be text or a number")
+
+
+def _check_item_path_edit(table: str, edit: dict, at: str, errs: list) -> tuple:
+    """An item table given by its ROM path and the layout of its records: one file, a row by
+    its index, the strings by position."""
+    layout = edit.get("layout")
+    if layout not in LAYOUTS:
+        errs.append(f"{at}.layout must be an item layout ({', '.join(LAYOUTS)})")
+        layout = None
+    if "server" in edit:
+        errs.append(f"{at}.server: a table by path has no server side")
+    if "copy_from" in edit and not _is_int(edit["copy_from"]):
+        errs.append(f"{at}.copy_from must be the row to copy")
+    if "note" in edit and not isinstance(edit["note"], str):
+        errs.append(f"{at}.note must be a string")
+    if "set" in edit and layout:
+        _check_set(table, edit["set"], f"{at}.set", errs, layout)
+    if "strings" in edit:
+        _check_sub_strings(edit["strings"], f"{at}.strings", errs)
+    if "icon" in edit:
+        _check_icon(edit["icon"], f"{at}.icon", errs)
+    if "hex" in edit:
+        _check_hex(edit["hex"], None, f"{at}.hex", errs)
+    if not ({"copy_from", "set", "strings", "icon", "hex", "like"} & edit.keys()):
+        errs.append(f"{at}: the edit changes nothing (give set, strings, icon, copy_from or hex)")
+    return table, edit.get("id")
+
+
+def _check_plain_edit(table: str, edit: dict, at: str, errs: list) -> tuple:
+    """A spell / command record, or a d_msg table by path: one file for every language."""
+    menu = table in MENU_KINDS
+    allowed = {"table", "id", "copy_from", "note", "hex", "server"} | ({"set"} if menu else {"strings"})
+    for key in sorted(edit.keys() - allowed - {"table", "id", "layout"}):
+        if key in _EDIT_KEYS:
+            errs.append(f"{at}.{key}: {table!r} takes " + ("set, copy_from, hex or server: false" if menu
+                                                             else "strings, copy_from or hex"))
+    if "server" in edit and (not menu or edit["server"] is not False):
+        errs.append(f"{at}.server: only false (no proposed SQL for this edit)" if menu
+                    else f"{at}.server: a table by path has no server side")
+    if "copy_from" in edit and not _is_int(edit["copy_from"]):
+        errs.append(f"{at}.copy_from must be the id of the record to copy")
+    if "note" in edit and not isinstance(edit["note"], str):
+        errs.append(f"{at}.note must be a string")
+    if menu and "set" in edit:
+        _check_menu_set(table, edit["set"], f"{at}.set", errs)
+    if not menu and "strings" in edit:
+        _check_sub_strings(edit["strings"], f"{at}.strings", errs)
+    if "hex" in edit:
+        if menu:
+            from xi.menu.xi_menu_table import KINDS
+            _check_hex(edit["hex"], KINDS[MENU_KINDS[table]].stride, f"{at}.hex", errs)
+        else:
+            _check_hex(edit["hex"], None, f"{at}.hex", errs)
+    if not ({"copy_from", "set", "strings", "hex", "like"} & edit.keys()):
+        errs.append(f"{at}: the edit changes nothing (give " + ("set, copy_from or hex)" if menu
+                                                                  else "strings, copy_from or hex)"))
+    return table, edit.get("id")
+
+
+def validate_action(action) -> list[str]:
+    """Problems with a ``database`` action, each naming the field; ``[]`` when it is valid.
+    Mirrors schema/database.json, plus what the schema can't say: which fields and
+    sub-strings each table has. Whether an id exists in the install is the build's check."""
+    if not isinstance(action, dict):
+        return ["the action must be an object"]
+    errs: list[str] = []
+    _unknown(action, _ACTION_KEYS, "action", errs)
+    if action.get("type") != "database":
+        errs.append("type must be 'database'")
+    if not (isinstance(action.get("id"), str) and _ID_RE.match(action["id"])):
+        errs.append("id must be an action id (^[a-z0-9][a-z0-9_.-]*$)")
+    if "enabled" in action and not isinstance(action["enabled"], bool):
+        errs.append("enabled must be true or false")
+    if "description" in action and not isinstance(action["description"], str):
+        errs.append("description must be a string")
+    deps = action.get("depends_on", [])
+    if not (isinstance(deps, list) and all(isinstance(d, str) and _ID_RE.match(d) for d in deps)):
+        errs.append("depends_on must be a list of action ids")
+    server = action.get("server", {})
+    if not isinstance(server, dict):
+        errs.append("server must be an object")
+    else:
+        _unknown(server, _SERVER_KEYS, "server", errs)
+        for key in ("emit", "mirror"):
+            if key in server and not isinstance(server[key], bool):
+                errs.append(f"server.{key} must be true or false")
+        if "sql" in server and not (isinstance(server["sql"], str) and server["sql"].lower().endswith(".sql")):
+            errs.append("server.sql must be a path ending in .sql")
+    edits = action.get("edits")
+    if not isinstance(edits, list) or not edits:
+        errs.append("edits must be a non-empty list")
+        return errs
+    seen: dict = {}
+    for i, edit in enumerate(edits):
+        key = _check_edit(edit, f"edits[{i}]", errs)
+        if key and key in seen:
+            errs.append(f"edits[{i}]: {key[0]} {key[1]} is already edited by edits[{seen[key]}] — merge them")
+        elif key:
+            seen[key] = i
+    return errs
